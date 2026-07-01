@@ -11,3 +11,4 @@ transformers
 python-dotenv
 fastapi
 uvicorn[standard]
+duckduckgo-search

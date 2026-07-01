@@ -54,6 +54,8 @@ use_step_back: True
 use_multi_query: True
 use_hyde: True
 use_rerank: True
+use_agentic_rag: True
+agentic_web_results: 4
 use_routing: True
 use_memory: True
 max_articles: 500
