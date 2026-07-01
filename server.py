@@ -68,7 +68,7 @@ class SchemeOut(BaseModel):
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _build_prompt(query: str, chunks: list[dict]) -> str:
+def _build_prompt(query: str, chunks: list[dict], web_results: list[dict] = []) -> str:
     parts = []
     for i, c in enumerate(chunks, 1):
         block = [f"[{i}] {c.get('title', 'Scheme')}"]
@@ -78,18 +78,36 @@ def _build_prompt(query: str, chunks: list[dict]) -> str:
             block.append(f"Eligibility: {c['eligibility_summary']}")
         block.append(f"Details: {c['text']}")
         parts.append("\n".join(block))
-    return "CONTEXT:\n" + "\n\n".join(parts) + f"\n\nQUESTION: {query}"
+    context = "CONTEXT:\n" + "\n\n".join(parts) if parts else "CONTEXT:\n(none)"
+
+    if web_results:
+        web_parts = []
+        for i, r in enumerate(web_results, 1):
+            web_parts.append(f"[W{i}] {r['title']}\n{r['snippet']}\nSource: {r['url']}")
+        web_section = "WEB RESULTS:\n" + "\n\n".join(web_parts)
+        return f"{context}\n\n{web_section}\n\nQUESTION: {query}"
+
+    return f"{context}\n\nQUESTION: {query}"
 
 
-def _build_messages(prompt: str, recent_msgs: list, summary: str) -> list[dict]:
-    system = (
-        "You are Yojan AI, a helpful assistant for Indian government scheme discovery. "
-        "Answer in 2-4 plain sentences using the CONTEXT provided. "
-        "Cite each scheme by its number like [1] or [2]. "
-        "If the context contains schemes that are broadly relevant — even if not an exact keyword match — describe how they can help. "
-        "Only say 'I couldn't find a matching scheme in my database.' if the context is completely unrelated to the question. "
-        "Do NOT use markdown, blockquotes, bullet points, or headers — plain text only."
-    )
+def _build_messages(prompt: str, recent_msgs: list, summary: str, has_web: bool = False) -> list[dict]:
+    if has_web:
+        system = (
+            "You are Yojan AI, a helpful assistant for Indian government scheme discovery. "
+            "Answer in 2-4 plain sentences using the CONTEXT and WEB RESULTS provided. "
+            "Cite database schemes as [1], [2] and web results as [W1], [W2]. "
+            "If the context contains broadly relevant schemes, describe how they can help. "
+            "Do NOT use markdown, blockquotes, bullet points, or headers — plain text only."
+        )
+    else:
+        system = (
+            "You are Yojan AI, a helpful assistant for Indian government scheme discovery. "
+            "Answer in 2-4 plain sentences using the CONTEXT provided. "
+            "Cite each scheme by its number like [1] or [2]. "
+            "If the context contains schemes that are broadly relevant — even if not an exact keyword match — describe how they can help. "
+            "Only say 'I couldn't find a matching scheme in my database.' if the context is completely unrelated to the question. "
+            "Do NOT use markdown, blockquotes, bullet points, or headers — plain text only."
+        )
     messages = [{"role": "system", "content": system}]
     if summary:
         messages.append({"role": "user", "content": f"Conversation summary so far: {summary}"})
