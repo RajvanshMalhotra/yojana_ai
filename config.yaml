@@ -42,7 +42,7 @@ ivf_nprobe: 20
 chunks_path: "chunks.pkl"
 pinecone_index_name: "yojan-schemes" #this plays a crtical role in routing queries to the right index, har data ka alag index hai 
 
-llm_model: "Qwen/Qwen2.5-7B-Instruct"
+llm_model: "Qwen/Qwen2.5-72B-Instruct"
 
 embedding_model: "Qwen/Qwen3-Embedding-0.6B"
 

@@ -210,10 +210,12 @@ async def chat(req: ChatRequest):
         n_web = config.get("agentic_web_results", 4)
         insufficient = len(unique_chunks) <= config.get("top_k", 5)
         search_query = getattr(retriever, "last_step_back_query", req.message)
+        print(f"Agentic   : chunks={len(unique_chunks)} insufficient={insufficient} query={search_query!r}")
         if insufficient:
             web_results = await loop.run_in_executor(
                 None, retriever.web_search, search_query, n_web
             )
+            print(f"Web hits  : {len(web_results)}")
 
     prompt   = _build_prompt(req.message, unique_chunks, web_results)
     messages = _build_messages(prompt, recent_msgs, summary, has_web=bool(web_results))
