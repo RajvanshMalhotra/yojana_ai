@@ -23,6 +23,8 @@ class retriever:
         self.use_multi_query      = config.get("use_multi_query", False)
         self.use_rerank           = config.get("use_rerank", False)
         self.use_step_back        = config.get("use_step_back", False)
+        self.use_agentic_rag      = config.get("use_agentic_rag", False)
+        self.agentic_web_results  = config.get("agentic_web_results", 4)
         self.max_expanded_queries = config.get("max_expanded_queries", 3)
 
         self.embedding_model = SentenceTransformer(config["embedding_model"])
@@ -226,7 +228,15 @@ Generate exactly {self.max_expanded_queries} diverse rephrasing of the user's qu
             results.append(chunk)
         return results
 
-  
+    def web_search(self, query: str, n: int = 4) -> list[dict]:
+        """DuckDuckGo fallback — returns [{title, snippet, url}, …] or [] on failure."""
+        from duckduckgo_search import DDGS
+        try:
+            with DDGS() as ddgs:
+                raw = ddgs.text(f"{query} India government", max_results=n)
+            return [{"title": r["title"], "snippet": r["body"], "url": r["href"]} for r in raw]
+        except Exception:
+            return []
 
     def _reciprocal_rank_fusion(
         self, dense: list[dict], sparse: list[dict], k: int = 60
