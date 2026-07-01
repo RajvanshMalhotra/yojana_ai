@@ -357,10 +357,13 @@ Return ONLY a raw JSON object — no markdown, no explanation:
 
             if self.use_multi_query:
                 queries.extend(expanded)
+
+            self.last_step_back_query = step_back
         else:
             filters_raw = self.parse_query(query)
             filters = self._build_pinecone_filter(filters_raw)
             queries = [query]
+            self.last_step_back_query = query
 
         print(f"Filters   : {filters}")
         print(f"Step-back : {queries[0] if self.use_step_back else '(off)'}")

@@ -207,13 +207,12 @@ async def chat(req: ChatRequest):
     web_results: list[dict] = []
     if use_agentic:
         n_web = config.get("agentic_web_results", 4)
-        judge_task  = loop.run_in_executor(None, _judge, unique_chunks, req.message)
-        search_task = loop.run_in_executor(
-            None, retriever.web_search, req.message, n_web
-        )
-        verdict, web_candidates = await asyncio.gather(judge_task, search_task)
-        if verdict == "insufficient":
-            web_results = web_candidates
+        insufficient = len(unique_chunks) < config.get("top_k", 5)
+        search_query = getattr(retriever, "last_step_back_query", req.message)
+        if insufficient:
+            web_results = await loop.run_in_executor(
+                None, retriever.web_search, search_query, n_web
+            )
 
     prompt   = _build_prompt(req.message, unique_chunks, web_results)
     messages = _build_messages(prompt, recent_msgs, summary, has_web=bool(web_results))
