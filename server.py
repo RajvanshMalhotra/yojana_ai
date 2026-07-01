@@ -122,6 +122,36 @@ def _sse(payload: dict) -> str:
     return f"data: {json.dumps(payload)}\n\n"
 
 
+def _judge(chunks: list[dict], query: str) -> str:
+    """
+    Fast LLM call that decides if RAG context fully answers the query.
+    Returns 'sufficient' or 'insufficient'.
+    """
+    if not chunks:
+        return "insufficient"
+
+    compact = "\n".join(
+        f"[{i}] {c.get('title','')} — {c.get('benefit_summary','')}"
+        for i, c in enumerate(chunks, 1)
+    )
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are a relevance judge. Given a question and a list of retrieved scheme summaries, "
+                "decide if the context fully answers the question. "
+                "Reply with exactly one word: sufficient or insufficient."
+            ),
+        },
+        {"role": "user", "content": f"Question: {query}\n\nContext:\n{compact}"},
+    ]
+    response = _state["gen_client"].chat.completions.create(messages=messages)
+    verdict = response.choices[0].message.content.strip().lower()
+    if "</think>" in verdict:
+        verdict = verdict.split("</think>", 1)[-1].strip()
+    return "sufficient" if verdict == "sufficient" else "insufficient"
+
+
 # ── Route ─────────────────────────────────────────────────────────────────────
 
 @app.post("/api/chat")
