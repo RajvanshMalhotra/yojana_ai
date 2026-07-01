@@ -7,3 +7,4 @@ node_modules/
 frontend/dist/
 .superpowers/
 chat_history.json
+CLAUDE.md
