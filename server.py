@@ -194,7 +194,9 @@ async def chat(req: ChatRequest):
     unique_chunks = _dedup_by_title(chunks)
     schemes = [_chunk_to_scheme(c) for c in unique_chunks]
 
-    if not unique_chunks:
+    use_agentic = config.get("use_agentic_rag", False)
+
+    if not unique_chunks and not use_agentic:
         async def _empty():
             yield _sse({"type": "schemes", "schemes": []})
             yield _sse({"type": "token", "content": "I couldn't find a matching scheme in my database."})
@@ -202,8 +204,19 @@ async def chat(req: ChatRequest):
         return StreamingResponse(_empty(), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
-    prompt   = _build_prompt(req.message, unique_chunks)
-    messages = _build_messages(prompt, recent_msgs, summary)
+    web_results: list[dict] = []
+    if use_agentic:
+        n_web = config.get("agentic_web_results", 4)
+        judge_task  = loop.run_in_executor(None, _judge, unique_chunks, req.message)
+        search_task = loop.run_in_executor(
+            None, retriever.web_search, req.message, n_web
+        )
+        verdict, web_candidates = await asyncio.gather(judge_task, search_task)
+        if verdict == "insufficient":
+            web_results = web_candidates
+
+    prompt   = _build_prompt(req.message, unique_chunks, web_results)
+    messages = _build_messages(prompt, recent_msgs, summary, has_web=bool(web_results))
 
     def _stream_gen():
         """Synchronous SSE generator — runs in FastAPI's threadpool."""
