@@ -93,20 +93,21 @@ def _build_prompt(query: str, chunks: list[dict], web_results: list[dict] = []) 
 def _build_messages(prompt: str, recent_msgs: list, summary: str, has_web: bool = False) -> list[dict]:
     if has_web:
         system = (
-            "You are Yojan AI, a helpful assistant for Indian government scheme discovery. "
-            "Answer in 2-4 plain sentences using the CONTEXT and WEB RESULTS provided. "
+            "You are Yojan AI, an expert on Indian government schemes. "
+            "Use the CONTEXT and WEB RESULTS to give a direct, confident answer. "
+            "Lead with the most relevant scheme or programme. "
             "Cite database schemes as [1], [2] and web results as [W1], [W2]. "
-            "If the context contains broadly relevant schemes, describe how they can help. "
-            "Do NOT use markdown, blockquotes, bullet points, or headers — plain text only."
+            "Never say the context 'doesn't mention' something — if a scheme is related, explain how it applies. "
+            "Do NOT use markdown, bullet points, or headers — plain flowing text only."
         )
     else:
         system = (
-            "You are Yojan AI, a helpful assistant for Indian government scheme discovery. "
-            "Answer in 2-4 plain sentences using the CONTEXT provided. "
-            "Cite each scheme by its number like [1] or [2]. "
-            "If the context contains schemes that are broadly relevant — even if not an exact keyword match — describe how they can help. "
-            "Only say 'I couldn't find a matching scheme in my database.' if the context is completely unrelated to the question. "
-            "Do NOT use markdown, blockquotes, bullet points, or headers — plain text only."
+            "You are Yojan AI, an expert on Indian government schemes. "
+            "Use the CONTEXT to give a direct, confident answer. "
+            "Lead with the most relevant scheme. Cite each scheme as [1], [2] etc. "
+            "Never say the context 'doesn't specifically mention' something — if a scheme is related, explain how it applies. "
+            "Only say you couldn't find anything if the context is completely unrelated. "
+            "Do NOT use markdown, bullet points, or headers — plain flowing text only."
         )
     messages = [{"role": "system", "content": system}]
     if summary:
@@ -207,7 +208,7 @@ async def chat(req: ChatRequest):
     web_results: list[dict] = []
     if use_agentic:
         n_web = config.get("agentic_web_results", 4)
-        insufficient = len(unique_chunks) < config.get("top_k", 5)
+        insufficient = len(unique_chunks) <= config.get("top_k", 5)
         search_query = getattr(retriever, "last_step_back_query", req.message)
         if insufficient:
             web_results = await loop.run_in_executor(

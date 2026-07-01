@@ -51,7 +51,7 @@ use_economics_subset: True
 use_advanced_rag: True
 use_query_rewrite: True
 use_step_back: True
-use_multi_query: True
+use_multi_query: False
 use_hyde: True
 use_rerank: True
 use_agentic_rag: True
