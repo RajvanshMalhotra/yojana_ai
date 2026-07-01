@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.env
+data/
+*.pkl
+node_modules/
+frontend/dist/
+.superpowers/
+chat_history.json

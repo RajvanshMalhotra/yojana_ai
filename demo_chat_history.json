@@ -1,0 +1,29 @@
+{
+  "messages": [
+    {
+      "role": "user",
+      "content": "I'm building a RAG pipeline migrating from FAISS to Pinecone."
+    },
+    {
+      "role": "assistant",
+      "content": "Got it \u2014 want help with the embedding step or the index migration itself?"
+    },
+    {
+      "role": "user",
+      "content": "Embeddings, I'm using Gemini embeddings and hit some SDK issues."
+    },
+    {
+      "role": "assistant",
+      "content": "What error are you seeing exactly?"
+    },
+    {
+      "role": "user",
+      "content": "A dimension mismatch when upserting into the Pinecone index."
+    },
+    {
+      "role": "assistant",
+      "content": "That usually means your index was created with a different dimension than your embedding model outputs."
+    }
+  ],
+  "tokens": 81
+}

@@ -1,0 +1,13 @@
+sentence-transformers
+rank-bm25
+numpy
+pyyaml
+nltk
+datasets
+tqdm
+pinecone
+huggingface_hub
+transformers
+python-dotenv
+fastapi
+uvicorn[standard]

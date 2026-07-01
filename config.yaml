@@ -1,0 +1,64 @@
+# pdf_path: "https://pressbooks.oer.hawaii.edu/humannutrition2/open/download?type=pdf"
+
+# chunk_size: 100
+# min_chunk_size : 20
+# top_k: 5
+
+# embedding_model: "all-MiniLM-L6-v2"
+# data_dir : "data"
+# index_path: "index.faiss"
+# ivf_number_of_clusters: 200
+# ivf_nprobe : 20
+# chunks_path: "chunks.pkl"
+# pinecone_index_name: "adv-rag"
+# llm_model: "empero-ai/Qwythos-9B-Claude-Mythos-5-1M"
+
+
+# embedding_model: "Qwen/Qwen3-Embedding-0.6B"
+
+# # here are our new keys
+# use_economics_subset: True
+# use_advanced_rag: True
+# use_query_rewrite: True
+# use_multi_query: True
+# use_hyde: True
+# use_rerank: True
+# use_routing: True
+# use_memory: True
+# max_articles: 500
+# max_expanded_queries: 3
+# memory_recent_k: 3
+# min_message_for_summary : 6
+pdf_path: "https://pressbooks.oer.hawaii.edu/humannutrition2/open/download?type=pdf"
+
+chunk_size: 100
+min_chunk_size: 20
+top_k: 5
+
+data_dir: "data"
+index_path: "index.faiss"
+ivf_number_of_clusters: 200
+ivf_nprobe: 20
+chunks_path: "chunks.pkl"
+pinecone_index_name: "yojan-schemes" #this plays a crtical role in routing queries to the right index, har data ka alag index hai 
+
+llm_model: "Qwen/Qwen2.5-7B-Instruct"
+
+embedding_model: "Qwen/Qwen3-Embedding-0.6B"
+
+# here are our new keys
+use_economics_subset: True
+use_advanced_rag: True
+use_query_rewrite: True
+use_step_back: True
+use_multi_query: True
+use_hyde: True
+use_rerank: True
+use_routing: True
+use_memory: True
+max_articles: 500
+max_expanded_queries: 3
+
+# memory module config
+memory_recent_k: 3
+token_wall: 200000
