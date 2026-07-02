@@ -2,8 +2,19 @@ import os
 import re
 import json
 import numpy as np
+
+# Queries that contain personal pronouns, relational nouns, or vague intent words
+# are ambiguous and benefit from rewriting. Specific queries ("PM Kisan eligibility",
+# "scholarship for SC student") are already clear and should be passed through unchanged.
+_NEEDS_REWRITE_RE = re.compile(
+    r"\b(i|my|me|we|our|us|i'm|i've|i am|i have|i need|i want|"
+    r"help|need|want|looking|situation|issue|problem|"
+    r"daughter|son|father|mother|wife|husband|brother|sister|family|child|children|"
+    r"he|she|they|his|her|their)\b",
+    re.IGNORECASE,
+)
 import nltk
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from nltk.corpus import stopwords
 from sentence_transformers import SentenceTransformer, CrossEncoder
 from rank_bm25 import BM25Okapi
@@ -27,14 +38,35 @@ class retriever:
         self.agentic_web_results  = config.get("agentic_web_results", 4)
         self.max_expanded_queries = config.get("max_expanded_queries", 3)
 
-        self.embedding_model = SentenceTransformer(config["embedding_model"])
+        import torch
+        if torch.backends.mps.is_available():
+            device = "mps"
+        elif torch.cuda.is_available():
+            device = "cuda"
+        else:
+            device = "cpu"
+        print(f"Device    : {device}")
 
-        self.reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
-        self.client = InferenceClient(
-            provider="featherless-ai",
-            model=config["llm_model"],
-            api_key=os.environ["HF_TOKEN"],
-        )
+        self.embedding_model = SentenceTransformer(config["embedding_model"], device=device)
+        self.reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2", device=device)
+        # Use Groq for query processing (parse/rewrite/expand/classify) — much faster than featherless-ai.
+        # Falls back to featherless-ai if GROQ_API_KEY is not set.
+        _groq_keys = [k.strip() for k in os.environ.get("GROQ_API_KEYS", os.environ.get("GROQ_API_KEY", "")).split(",") if k.strip()]
+        if _groq_keys:
+            import random
+            from groq import Groq as _Groq
+            self.client = _Groq(api_key=random.choice(_groq_keys))
+            self._query_model = "llama-3.1-8b-instant"
+            print("Query LLM  : Groq llama-3.1-8b-instant")
+        else:
+            query_model = config.get("query_llm_model", config["llm_model"])
+            self.client = InferenceClient(
+                provider="featherless-ai",
+                model=query_model,
+                api_key=os.environ["HF_TOKEN"],
+            )
+            self._query_model = query_model
+            print(f"Query LLM  : featherless-ai {query_model}")
 
         tokenized_corpus = [self._tokenize(c["text"]) for c in chunks]
         self.bm25 = BM25Okapi(tokenized_corpus)
@@ -50,6 +82,7 @@ class retriever:
     def _llm(self, system: str, user: str) -> str:
         """Single helper for every LLM call so the rest of the code stays clean."""
         response = self.client.chat.completions.create(
+            model=self._query_model,
             messages=[
                 {"role": "system", "content": system},
                 {"role": "user",   "content": user},
@@ -123,11 +156,17 @@ Return ONLY raw JSON. No markdown."""
 
   
 
+    @staticmethod
+    def _needs_rewrite(query: str) -> bool:
+        """Returns True only for ambiguous/personal queries that benefit from rewriting.
+        Specific queries like 'PM Kisan eligibility' are passed through unchanged."""
+        return bool(_NEEDS_REWRITE_RE.search(query))
+
     def rewrite_query(self, query: str, recent_messages: list = []) -> str:
-        """
-        Fixes grammar / Hinglish and resolves references ("it", "that") using
-        chat history, giving the embedding model a clean search query.
-        """
+        """Rewrites only if the query is ambiguous — skips the LLM call for clear queries."""
+        if not self._needs_rewrite(query):
+            return query
+
         system = """You are a query rewriter for an Indian government scheme search.
 
 Rewrite the user's query into a clean, standalone English search query.
@@ -135,7 +174,6 @@ Rewrite the user's query into a clean, standalone English search query.
   2. Fix grammar, spelling, Hinglish.
   3. Remove filler ("can you", "tell me").
   4. Keep all important entities and constraints.
-  5. If already clear, return unchanged.
 
 Output ONLY the rewritten query."""
 
@@ -161,27 +199,18 @@ Generate exactly {self.max_expanded_queries} diverse rephrasing of the user's qu
    
 
     def semantic_search(self, query: str, filters: dict = None, top_k: int = 20) -> list[dict]:
-        """
-        Embeds the query and finds the most similar chunks in Pinecone.
+        """Single-query path — encodes then queries Pinecone. Not used inside
+        multi_query_retrieval (which batch-encodes to avoid thread-safety issues)."""
+        embedding = self.embedding_model.encode(
+            [query], prompt_name="query", normalize_embeddings=True,
+        )[0].tolist()
+        return self._pinecone_query(embedding, filters, top_k)
 
-        filters — Pinecone metadata filter from _build_pinecone_filter().
-                  Narrows the search space before vector comparison runs.
-        top_k   — pull more candidates here; reranking trims to final top_k later.
-        """
-
-        query_embedding = self.embedding_model.encode(
-            [query],
-            prompt_name="query",
-            normalize_embeddings=True,
-        )
-
+    def _pinecone_query(self, embedding: list, filters: dict | None, top_k: int) -> list[dict]:
+        """Thread-safe: pure Pinecone network call, no tokenization."""
         results = self.index.query(
-            vector=query_embedding[0].tolist(),
-            filter=filters,
-            top_k=top_k,
-            include_metadata=True,
+            vector=embedding, filter=filters, top_k=top_k, include_metadata=True,
         )
-
         chunks = []
         for match in results["matches"]:
             chunk = match["metadata"].copy()
@@ -229,13 +258,40 @@ Generate exactly {self.max_expanded_queries} diverse rephrasing of the user's qu
         return results
 
     def web_search(self, query: str, n: int = 4) -> list[dict]:
-        """DuckDuckGo fallback — returns [{title, snippet, url}, …] or [] on failure."""
-        from duckduckgo_search import DDGS
+        """Firecrawl search — returns [{title, snippet, url, content?}, …] or [] on failure.
+        Scrapes full content from the top result so the LLM has rich context, not just snippets."""
         try:
-            with DDGS() as ddgs:
-                raw = ddgs.text(f"{query} India government", max_results=n)
-            return [{"title": r["title"], "snippet": r["body"], "url": r["href"]} for r in raw]
-        except Exception:
+            from firecrawl import FirecrawlApp
+            app = FirecrawlApp(api_key=os.environ["FIRECRAWL_API_KEY"])
+            search_query = f"{query} India"
+            data = app.search(search_query, limit=n)
+            hits = data.web or []
+            print(f"[web] query='{search_query[:60]}'  hits={len(hits)}")
+            results = []
+            for i, r in enumerate(hits):
+                entry = {
+                    "title":   r.title or "",
+                    "snippet": r.description or "",
+                    "url":     r.url or "",
+                }
+                if i == 0 and entry["url"]:
+                    try:
+                        import concurrent.futures as _cf
+                        with _cf.ThreadPoolExecutor(max_workers=1) as _ex:
+                            _fut = _ex.submit(app.scrape_url, entry["url"], formats=["markdown"])
+                            try:
+                                scraped = _fut.result(timeout=5)
+                                if scraped and scraped.markdown:
+                                    entry["content"] = scraped.markdown[:5000]
+                                    print(f"[web] scraped {len(entry['content'])} chars from {entry['url'][:60]}")
+                            except _cf.TimeoutError:
+                                print(f"[web] scrape timed out, skipping")
+                    except Exception as e:
+                        print(f"[web] scrape failed: {e}")
+                results.append(entry)
+            return results
+        except Exception as e:
+            print(f"[web] search failed: {e}")
             return []
 
     def _reciprocal_rank_fusion(
@@ -265,23 +321,26 @@ Generate exactly {self.max_expanded_queries} diverse rephrasing of the user's qu
         return [chunk_map[cid] for cid in ranked_ids]
 
     def multi_query_retrieval(self, queries: list[str], filters: dict = None) -> list[dict]:
-        """Runs hybrid search for every query variant in parallel and fuses all results."""
-        all_dense  = []
-        all_sparse = []
+        """Runs hybrid search for every query variant in parallel and fuses all results.
 
-        def _dense(q):  return self.semantic_search(q, filters=filters, top_k=15)
-        def _sparse(q): return self.keyword_search(q, top_k=15, filters=filters)
+        Embeddings are batch-encoded serially BEFORE entering the thread pool because
+        the HuggingFace fast tokenizer's Rust backend is not thread-safe (raises
+        'Already borrowed' when encode() is called from concurrent threads).
+        Only the Pinecone network calls and BM25 scoring run in parallel."""
+        # Single batch encode — safe, serialised
+        embeddings = self.embedding_model.encode(
+            queries, prompt_name="query", normalize_embeddings=True, batch_size=32,
+        )
 
-        tasks = [(fn, q) for q in queries for fn in (_dense, _sparse)]
-        with ThreadPoolExecutor(max_workers=len(tasks)) as pool:
-            futures = {pool.submit(fn, q): (fn.__name__, q) for fn, q in tasks}
-            for fut in as_completed(futures):
-                fn_name, _ = futures[fut]
-                results = fut.result()
-                if fn_name == "_dense":
-                    all_dense.extend(results)
-                else:
-                    all_sparse.extend(results)
+        def _dense(emb):  return self._pinecone_query(emb.tolist(), filters, top_k=15)
+        def _sparse(q):   return self.keyword_search(q, top_k=15, filters=filters)
+
+        n = len(queries)
+        with ThreadPoolExecutor(max_workers=n * 2) as pool:
+            dense_futs  = [pool.submit(_dense, emb) for emb in embeddings]
+            sparse_futs = [pool.submit(_sparse, q)  for q in queries]
+            all_dense   = [c for f in dense_futs  for c in f.result()]
+            all_sparse  = [c for f in sparse_futs for c in f.result()]
 
         return self._reciprocal_rank_fusion(all_dense, all_sparse)
 
@@ -340,12 +399,25 @@ Return ONLY a raw JSON object — no markdown, no explanation:
                 pass
         return {}, query, query, []
 
-    def retrieve(self, query: str, recent_messages: list = []) -> list[dict]:
+    def retrieve(self, query: str, recent_messages: list = [], fast: bool = False) -> list[dict]:
         """
         Full retrieval pipeline — one LLM call handles parse + rewrite + step-back + expand,
         then parallel hybrid search and rerank.
+
+        fast=True skips all LLM pre-processing (query rewrite, step-back, expand,
+        complexity classification). Used for voice mode where latency is critical.
+        Cuts retrieval from ~12s down to ~1-2s.
         """
-        if self.use_query_rewrite or self.use_multi_query or self.use_step_back:
+        if fast:
+            # Voice fast path: rewrite only if the query is ambiguous (regex gate, no LLM for clear queries)
+            rewritten = self.rewrite_query(query, recent_messages) if self.use_query_rewrite else query
+            queries = [rewritten]
+            self.last_step_back_query = rewritten
+            self.last_is_complex = False  # always route to 7B in voice mode
+            print(f"[fast] rewritten='{rewritten[:80]}'")
+
+            candidates = self.multi_query_retrieval(queries, None)
+        elif self.use_query_rewrite or self.use_multi_query or self.use_step_back:
             filters_raw, rewritten, step_back, expanded = self._parse_rewrite_expand(query, recent_messages)
             filters = self._build_pinecone_filter(filters_raw)
 
@@ -353,26 +425,41 @@ Return ONLY a raw JSON object — no markdown, no explanation:
             queries = [primary]
 
             if self.use_step_back:
-                queries.insert(0, step_back)   # step-back first → highest RRF weight
+                queries.insert(0, step_back)
 
             if self.use_multi_query:
                 queries.extend(expanded)
 
             self.last_step_back_query = step_back
+            print(f"Filters   : {filters}")
+            print(f"Step-back : {queries[0] if self.use_step_back else '(off)'}")
+            print(f"Primary   : {queries[0] if not self.use_step_back else queries[1] if len(queries) > 1 else '—'}")
+
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                search_fut   = pool.submit(self.multi_query_retrieval, queries, filters)
+                classify_fut = pool.submit(self._classify_complexity, query)
+                candidates   = search_fut.result()
+                is_complex   = classify_fut.result()
+
+            self.last_is_complex = is_complex
+            print(f"Complex   : {is_complex}")
         else:
             filters_raw = self.parse_query(query)
             filters = self._build_pinecone_filter(filters_raw)
             queries = [query]
             self.last_step_back_query = query
+            print(f"Filters   : {filters}")
 
-        print(f"Filters   : {filters}")
-        print(f"Step-back : {queries[0] if self.use_step_back else '(off)'}")
-        print(f"Primary   : {queries[0] if not self.use_step_back else queries[1] if len(queries) > 1 else '—'}")
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                search_fut   = pool.submit(self.multi_query_retrieval, queries, filters)
+                classify_fut = pool.submit(self._classify_complexity, query)
+                candidates   = search_fut.result()
+                is_complex   = classify_fut.result()
 
-    
-        candidates = self.multi_query_retrieval(queries, filters=filters)
+            self.last_is_complex = is_complex
+            print(f"Complex   : {is_complex}")
 
-        # Deduplicate by chunk_id → text fingerprint → title, in that priority order
+        # Deduplicate by chunk_id → text fingerprint → title
         seen = set()
         deduped = []
         for c in candidates:
@@ -382,12 +469,35 @@ Return ONLY a raw JSON object — no markdown, no explanation:
                 deduped.append(c)
         candidates = deduped
 
-        if self.use_rerank:
+        if self.use_rerank and not fast:
             candidates = self.rerank(queries[0], candidates, top_k=self.top_k)
         else:
             candidates = candidates[:self.top_k]
 
         return candidates
+
+    def _classify_complexity(self, query: str) -> bool:
+        """Fast LLM call — runs in parallel with search, decides 7B vs 72B routing.
+
+        Complex = multiple simultaneous hard eligibility constraints (caste + income + location + profession).
+        Simple  = broad topic, single beneficiary type, or named scheme lookup."""
+        resp = self.client.chat.completions.create(
+            model=self._query_model,
+            messages=[{"role": "user", "content": (
+                "Does this query specify MULTIPLE simultaneous hard eligibility constraints "
+                "(e.g. caste AND income limit AND location AND profession together)?\n"
+                "Simple examples: 'govt schemes for students', 'PM Kisan eligibility', "
+                "'startup grants for AI companies', 'health scheme for farmers'.\n"
+                "Complex examples: 'schemes for SC women farmers in UP earning below 1 lakh', "
+                "'disabled OBC student scholarship in Maharashtra for engineering'.\n"
+                "Reply with only one word: complex or simple\n\n"
+                f"Query: {query}"
+            )}]
+        )
+        verdict = resp.choices[0].message.content.strip().lower()
+        if "</think>" in verdict:
+            verdict = verdict.split("</think>", 1)[-1].strip()
+        return "complex" in verdict
 
 
 if __name__ == "__main__":

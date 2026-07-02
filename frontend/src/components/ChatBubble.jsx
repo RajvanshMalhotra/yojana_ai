@@ -5,6 +5,11 @@ import SchemeCard from './SchemeCard'
 export default function ChatBubble({ message }) {
   const isUser = message.role === 'user'
 
+  // Don't render placeholder bubbles that have no content yet
+  if (!isUser && !message.content && (!message.schemes || message.schemes.length === 0)) {
+    return null
+  }
+
   return (
     <motion.div
       initial={{ opacity: 0, y: 16, scale: 0.97 }}
@@ -52,6 +57,29 @@ export default function ChatBubble({ message }) {
           </ReactMarkdown>
         )}
       </div>
+
+      {/* Latency / stats badge */}
+      {!isUser && message.stats && (
+        <div style={{
+          marginTop: 6,
+          display: 'flex',
+          flexWrap: 'wrap',
+          gap: '4px 10px',
+          fontFamily: 'Outfit, sans-serif',
+          fontWeight: 300,
+          fontSize: 11,
+          color: 'var(--text-faint)',
+        }}>
+          <span title="Estimated prompt tokens">↑ {message.stats.prompt_tokens} tok</span>
+          <span title="Completion tokens">↓ {message.stats.completion_tokens} tok</span>
+          <span title="Time to first token">TTFT {message.stats.ttft}s</span>
+          <span title="Retrieval time">ret {message.stats.retrieval_s}s</span>
+          <span title="Generation time">gen {message.stats.gen_s}s</span>
+          <span title="Total wall time" style={{ color: 'var(--text-muted)' }}>
+            total {message.stats.total_s}s
+          </span>
+        </div>
+      )}
 
       {/* Scheme cards below assistant message */}
       {!isUser && message.schemes && message.schemes.length > 0 && (

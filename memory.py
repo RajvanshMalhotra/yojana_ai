@@ -9,17 +9,18 @@ load_dotenv()
 class Memory:
     def __init__(self, config, file_path="chat_history.json"):
         self.file_path = file_path
-        self.llm_model = config["llm_model"]
         self.memory_recent_k = config["memory_recent_k"]
-        self.token_wall = config.get("token_wall", 200_000)  # not in YAML yet, defaults here
+        self.token_wall = config.get("token_wall", 200_000)
 
+        # Use the small/fast query model for summarisation — 7B is plenty for this task
+        summary_model = config.get("query_llm_model", config["llm_model"])
         self.client = InferenceClient(
-            provider="hf-inference",
-            model=self.llm_model,
+            provider="featherless-ai",
+            model=summary_model,
             api_key=os.environ["HF_TOKEN"],
         )
         self.tokenizer = AutoTokenizer.from_pretrained(
-            self.llm_model,
+            summary_model,
             token=os.environ.get("HF_TOKEN"),
         )
         self.token_count = 0
@@ -63,8 +64,7 @@ class Memory:
 
         {text}"""
 
-        response = self.client.chat_completion(
-            model=self.llm_model,
+        response = self.client.chat.completions.create(
             messages=[{"role": "user", "content": prompt}],
             max_tokens=120,
         )

@@ -22,7 +22,7 @@
 # use_query_rewrite: True
 # use_multi_query: True
 # use_hyde: True
-# use_rerank: True
+# use_rerank: False
 # use_routing: True
 # use_memory: True
 # max_articles: 500
@@ -43,6 +43,7 @@ chunks_path: "chunks.pkl"
 pinecone_index_name: "yojan-schemes" #this plays a crtical role in routing queries to the right index, har data ka alag index hai 
 
 llm_model: "Qwen/Qwen2.5-72B-Instruct"
+query_llm_model: "Qwen/Qwen2.5-7B-Instruct"
 
 embedding_model: "Qwen/Qwen3-Embedding-0.6B"
 
@@ -53,9 +54,10 @@ use_query_rewrite: True
 use_step_back: True
 use_multi_query: False
 use_hyde: True
-use_rerank: True
+use_rerank: False
 use_agentic_rag: True
 agentic_web_results: 4
+max_new_tokens: 3000
 use_routing: True
 use_memory: True
 max_articles: 500

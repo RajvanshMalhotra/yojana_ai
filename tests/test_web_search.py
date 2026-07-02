@@ -1,10 +1,10 @@
+import os
 import pytest
 from unittest.mock import patch, MagicMock
 
 def make_retriever():
     """Build a minimal retriever without loading real models."""
     import sys, types
-    # Stub heavy deps so import doesn't load GPU models
     for mod in ["sentence_transformers", "rank_bm25", "huggingface_hub"]:
         if mod not in sys.modules:
             sys.modules[mod] = types.ModuleType(mod)
@@ -13,8 +13,9 @@ def make_retriever():
     sys.modules["rank_bm25"].BM25Okapi = MagicMock()
     sys.modules["huggingface_hub"].InferenceClient = MagicMock()
 
-    import importlib, os
+    import importlib
     os.environ.setdefault("HF_TOKEN", "test")
+    os.environ.setdefault("FIRECRAWL_API_KEY", "test-key")
     import retrieval
     importlib.reload(retrieval)
 
@@ -47,15 +48,24 @@ def make_retriever():
     return r
 
 
+def _make_fc_result(title, description, url):
+    m = MagicMock()
+    m.title = title
+    m.description = description
+    m.url = url
+    return m
+
+
 def test_web_search_returns_results():
     r = make_retriever()
-    fake_results = [
-        {"title": "Startup India", "href": "https://example.com", "body": "Grant for startups"},
-        {"title": "DPIIT Fund",    "href": "https://dpiit.gov.in", "body": "Seed funding scheme"},
+    fake_web = [
+        _make_fc_result("Startup India", "Grant for startups", "https://example.com"),
+        _make_fc_result("DPIIT Fund",    "Seed funding scheme", "https://dpiit.gov.in"),
     ]
-    with patch("duckduckgo_search.DDGS") as MockDDGS:
-        instance = MockDDGS.return_value.__enter__.return_value
-        instance.text.return_value = fake_results
+    mock_data = MagicMock()
+    mock_data.web = fake_web
+    with patch("firecrawl.FirecrawlApp") as MockApp:
+        MockApp.return_value.search.return_value = mock_data
         results = r.web_search("AI startup grants", n=2)
 
     assert len(results) == 2
@@ -66,16 +76,17 @@ def test_web_search_returns_results():
 
 def test_web_search_returns_empty_on_exception():
     r = make_retriever()
-    with patch("duckduckgo_search.DDGS", side_effect=Exception("network error")):
+    with patch("firecrawl.FirecrawlApp", side_effect=Exception("network error")):
         results = r.web_search("anything")
     assert results == []
 
 
 def test_web_search_appends_india_government():
     r = make_retriever()
-    with patch("duckduckgo_search.DDGS") as MockDDGS:
-        instance = MockDDGS.return_value.__enter__.return_value
-        instance.text.return_value = []
+    mock_data = MagicMock()
+    mock_data.web = []
+    with patch("firecrawl.FirecrawlApp") as MockApp:
+        MockApp.return_value.search.return_value = mock_data
         r.web_search("AI startup grants", n=3)
-        call_args = instance.text.call_args
+        call_args = MockApp.return_value.search.call_args
     assert "India government" in call_args[0][0]
