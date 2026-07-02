@@ -82,6 +82,13 @@ async def lifespan(app: FastAPI):
         )
         _state["draft_model"] = draft_model
         print(f"[startup] draft client: featherless-ai {draft_model}")
+    # Gemini client for Hinglish translation (gemini-2.5-flash)
+    gemini_key = os.environ.get("GEMINI_API_KEY")
+    if gemini_key:
+        from google import genai as _genai
+        _state["gemini_client"] = _genai.Client(api_key=gemini_key)
+        print("[startup] gemini client: gemini-2.5-flash")
+
     if config.get("use_memory", False):
         _state["memory"] = Memory(config)
 
@@ -759,38 +766,39 @@ async def voice_stt(request: Request, lang: str | None = Query(None)):
 
 def _to_hinglish(text: str) -> str:
     """Translate English → Hinglish (Hindi in Roman/Latin script) for TTS."""
-    client = _state.get("draft_client")
-    model  = _state.get("draft_model", "llama-3.1-8b-instant")
+    client = _state.get("gemini_client")
     if not client:
         return text
     print(f"[hinglish] in='{text[:120]}'")
+    prompt = (
+        "Translate this English text to Hinglish (Hindi in Roman/Latin script). Rules:\n"
+        "1. Keep ALL scheme names, abbreviations and proper nouns exactly as-is "
+        "(e.g. 'PM Kisan', 'Pradhan Mantri', 'PMAY', 'Ayushman Bharat').\n"
+        "2. Translate only the surrounding explanation to colloquial Hindi in Roman script.\n"
+        "3. No Devanagari characters at all.\n"
+        "4. Output only the translation, nothing else.\n"
+        "5. Use this domain glossary for key terms:\n"
+        "   scheme → 'yojana', government → 'sarkar', eligibility → 'patrata',\n"
+        "   benefit → 'laabh', application → 'aavedan', ministry → 'mantralaya',\n"
+        "   farmer → 'kisan', subsidy → 'subsidy', loan → 'loan', amount → 'rashi'.\n\n"
+        f"{text}"
+    )
     try:
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": (
-                "Translate this English text to Hinglish (Hindi in Roman/Latin script). Rules:\n"
-                "1. Keep ALL scheme names, abbreviations and proper nouns exactly as-is "
-                "(e.g. 'PM Kisan', 'Pradhan Mantri', 'PMAY', 'Ayushman Bharat').\n"
-                "2. Translate only the surrounding explanation to colloquial Hindi in Roman script.\n"
-                "3. No Devanagari characters at all.\n"
-                "4. Output only the translation, nothing else.\n"
-                "5. Use this domain glossary for key terms:\n"
-                "   scheme/yojana → 'yojana', government → 'sarkar', eligibility → 'patrata',\n"
-                "   benefit → 'laabh', application → 'aavedan', ministry → 'mantralaya',\n"
-                "   farmer → 'kisan', subsidy → 'subsidy', loan → 'loan', amount → 'rashi'.\n\n"
-                f"{text}"
-            )}],
-            stream=False,
-            max_tokens=min(len(text) * 3, 1000),
+        from google.genai import types as _gtypes
+        resp = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+            config=_gtypes.GenerateContentConfig(
+                thinking_config=_gtypes.ThinkingConfig(thinking_budget=0),
+            ),
         )
-        result = resp.choices[0].message.content.strip()
-        if "</think>" in result:
-            result = result.split("</think>", 1)[-1].strip()
+        result = (resp.text or "").strip()
         if re.search(r'[ऀ-ॿ]', result):
             return text
         print(f"[hinglish] out='{result[:120]}'")
         return result or text
-    except Exception:
+    except Exception as e:
+        print(f"[hinglish] error: {e}")
         return text
 
 
