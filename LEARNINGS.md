@@ -218,3 +218,44 @@ return [
 - `_HINDI_LANG_RULE` constant (heavy script-enforcement block in system prompt — unreliable, caused model confusion)
 - Pre-commit trick (fake user/assistant turns to prime Roman script — added token overhead, still failed)
 - Sequential Hindi branch in `/api/voice` (now uses same unified `retrieve(n_web=n_web)` path)
+
+---
+
+## Hindi TTS — Hinglish Translation Architecture (2026-07-03)
+
+### What went wrong
+
+Three approaches to get Hindi audio output all failed:
+
+**Attempt 1 — Force LLM to generate Hinglish directly:**
+Added `_HINDI_LANG_RULE` system prompt prefix + pre-commit trick (fake user/assistant turns priming Roman script). 8B model ignored both and still output Devanagari.
+
+**Attempt 2 — Post-generation romanization (`_romanize_hinglish`):**
+After LLM generated Devanagari, called Groq 70B to convert to Roman script. Then switched to 8B (user confirmed it worked in playground). In production, 8B returned Devanagari again. `_normalize_for_tts()` then stripped ALL Devanagari → only punctuation/spaces left → TTS received `','` and `':    -  ,  ,'` → garbage audio.
+
+**Root cause of attempt 2 failure:** Romanization (Devanagari → Roman) is hard for 8B. The model confuses "write the same Hindi words in Latin letters" with "translate to English." In playground it worked on simple inputs; on real RAG responses with citations like `[1]`, `[W2]`, and mixed content it broke.
+
+**Attempt 3 — Generate in English, romanize for TTS:**
+Removed all Hindi generation instructions so LLM naturally outputs English. Then romanized English chunks at the TTS layer. But English → Roman script is a no-op — Rumik still needs Hindi input to speak Hindi.
+
+### The fix that works
+
+**Separate concerns: generation language vs TTS language.**
+
+```
+LLM generates English  →  chat display shows English
+                       ↘
+                         /api/voice/tts (lang=hi)
+                           → _to_hinglish() translates English chunk → Hinglish
+                           → Rumik speaks Hindi
+```
+
+`_to_hinglish()` uses Groq 8B with a clean translation prompt:
+```python
+"Translate this English text to Hinglish — Hindi written in Roman/Latin script only,
+no Devanagari characters at all. Output only the translation."
+```
+
+**Why translation works but romanization didn't:** Translation (English → Hinglish) is a well-understood task the 8B model is trained on. Romanization (Devanagari → Roman script) is a rare task — the model wasn't reliably trained to just transliterate without changing words.
+
+**Key:** `lang` is already sent by the frontend in every `/api/voice/tts` request body. The server reads it and only calls `_to_hinglish()` when `lang == "hi"`. English voice calls are unaffected.
