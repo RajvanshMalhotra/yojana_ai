@@ -1,0 +1,16 @@
+[Unit]
+Description=Yojan AI FastAPI server
+After=network.target
+
+[Service]
+User=ubuntu
+WorkingDirectory=/home/ubuntu/yojan_ai
+EnvironmentFile=/home/ubuntu/yojan_ai/.env
+ExecStart=/home/ubuntu/yojan_ai/venv/bin/uvicorn server:app --host 127.0.0.1 --port 8000 --workers 1
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
