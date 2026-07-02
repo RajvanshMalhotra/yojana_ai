@@ -259,3 +259,18 @@ no Devanagari characters at all. Output only the translation."
 **Why translation works but romanization didn't:** Translation (English → Hinglish) is a well-understood task the 8B model is trained on. Romanization (Devanagari → Roman script) is a rare task — the model wasn't reliably trained to just transliterate without changing words.
 
 **Key:** `lang` is already sent by the frontend in every `/api/voice/tts` request body. The server reads it and only calls `_to_hinglish()` when `lang == "hi"`. English voice calls are unaffected.
+
+### Rumik Mulberry — Devanagari vs Hinglish audio quality (2026-07-03)
+
+Tested both input formats directly:
+- **Devanagari input** → audio quality is poor, mispronunciations, unnatural rhythm
+- **Hinglish (Roman script Hindi) input** → audio is clean, natural, no mistakes
+
+**Conclusion:** Always translate to Hinglish before sending to Mulberry, even though the API technically accepts Devanagari. The model was clearly trained predominantly on Roman script Hindi.
+
+Also discovered: the translation prompt must explicitly instruct the model to keep scheme names and proper nouns unchanged — otherwise 8B mangles them (e.g. "Pradhan Mantri" → "Pardanamneer"). Fixed prompt:
+```
+Keep ALL scheme names, abbreviations and proper nouns exactly as-is
+(e.g. 'PM Kisan', 'Pradhan Mantri', 'PMAY', 'Ayushman Bharat').
+Translate only the surrounding explanation to colloquial Hindi in Roman script.
+```
