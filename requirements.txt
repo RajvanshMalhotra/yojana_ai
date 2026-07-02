@@ -19,3 +19,4 @@ google-genai
 groq
 sarvamai
 pymupdf
+requests
