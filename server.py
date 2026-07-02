@@ -768,8 +768,12 @@ def _to_hinglish(text: str) -> str:
         resp = client.chat.completions.create(
             model=model,
             messages=[{"role": "user", "content": (
-                "Translate this English text to Hinglish — Hindi written in Roman/Latin script only, "
-                "no Devanagari characters at all. Output only the translation.\n\n"
+                "Translate this English text to Hinglish (Hindi in Roman/Latin script). Rules:\n"
+                "1. Keep ALL scheme names, abbreviations and proper nouns exactly as-is "
+                "(e.g. 'PM Kisan', 'Pradhan Mantri', 'PMAY', 'Ayushman Bharat').\n"
+                "2. Translate only the surrounding explanation to colloquial Hindi in Roman script.\n"
+                "3. No Devanagari characters at all.\n"
+                "4. Output only the translation, nothing else.\n\n"
                 f"{text}"
             )}],
             stream=False,
