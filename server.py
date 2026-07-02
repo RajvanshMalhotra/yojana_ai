@@ -15,27 +15,32 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 from huggingface_hub import InferenceClient
 
-# Pipecat pipeline imports
-from pipecat.pipeline.pipeline import Pipeline
-from pipecat.pipeline.task import PipelineTask, PipelineParams
-from pipecat.pipeline.runner import PipelineRunner
-from pipecat.processors.frame_processor import FrameProcessor, FrameDirection
-from pipecat.processors.aggregators.llm_context import LLMContext
-from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair, LLMContextFrame
-from pipecat.frames.frames import (
-    Frame, TextFrame, LLMFullResponseStartFrame, LLMFullResponseEndFrame,
-)
-from pipecat.services.sarvam.stt import SarvamSTTService
-from pipecat.services.sarvam.tts import SarvamTTSService
-from pipecat.services.sarvam.tts import Language as SarvamLanguage
-from pipecat.transcriptions.language import Language as PipecatLanguage
-from pipecat.transports.websocket.fastapi import FastAPIWebsocketTransport, FastAPIWebsocketParams
-from pipecat.serializers.protobuf import ProtobufFrameSerializer
-from pipecat.processors.audio.vad_processor import VADProcessor
-from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.turns.user_stop.speech_timeout_user_turn_stop_strategy import SpeechTimeoutUserTurnStopStrategy
-from pipecat.turns.user_start.vad_user_turn_start_strategy import VADUserTurnStartStrategy
-from pipecat.processors.aggregators.llm_response_universal import UserTurnStrategies, LLMUserAggregatorParams
+# Pipecat pipeline imports — optional; REST voice endpoints work without it
+try:
+    from pipecat.pipeline.pipeline import Pipeline
+    from pipecat.pipeline.task import PipelineTask, PipelineParams
+    from pipecat.pipeline.runner import PipelineRunner
+    from pipecat.processors.frame_processor import FrameProcessor, FrameDirection
+    from pipecat.processors.aggregators.llm_context import LLMContext
+    from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair, LLMContextFrame
+    from pipecat.frames.frames import (
+        Frame, TextFrame, LLMFullResponseStartFrame, LLMFullResponseEndFrame,
+    )
+    from pipecat.services.sarvam.stt import SarvamSTTService
+    from pipecat.services.sarvam.tts import SarvamTTSService
+    from pipecat.services.sarvam.tts import Language as SarvamLanguage
+    from pipecat.transcriptions.language import Language as PipecatLanguage
+    from pipecat.transports.websocket.fastapi import FastAPIWebsocketTransport, FastAPIWebsocketParams
+    from pipecat.serializers.protobuf import ProtobufFrameSerializer
+    from pipecat.processors.audio.vad_processor import VADProcessor
+    from pipecat.audio.vad.silero import SileroVADAnalyzer
+    from pipecat.turns.user_stop.speech_timeout_user_turn_stop_strategy import SpeechTimeoutUserTurnStopStrategy
+    from pipecat.turns.user_start.vad_user_turn_start_strategy import VADUserTurnStartStrategy
+    from pipecat.processors.aggregators.llm_response_universal import UserTurnStrategies, LLMUserAggregatorParams
+    PIPECAT_AVAILABLE = True
+except ModuleNotFoundError:
+    PIPECAT_AVAILABLE = False
+    FrameProcessor = object  # stub so class definitions below don't crash
 
 from indexing import load_index
 from retrieval import retriever as Retriever
@@ -824,6 +829,9 @@ async def voice_tts(request: Request):
 
 @app.websocket("/ws/voice")
 async def voice_ws(websocket: WebSocket, lang: str | None = Query(None)):
+    if not PIPECAT_AVAILABLE:
+        await websocket.close(code=1011, reason="pipecat not installed")
+        return
     """
     Pipecat pipeline:
       browser (PCM via @pipecat-ai/client-js) →
