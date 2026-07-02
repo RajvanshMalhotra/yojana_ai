@@ -763,6 +763,7 @@ def _to_hinglish(text: str) -> str:
     model  = _state.get("draft_model", "llama-3.1-8b-instant")
     if not client:
         return text
+    print(f"[hinglish] in='{text[:120]}'")
     try:
         resp = client.chat.completions.create(
             model=model,
@@ -772,7 +773,11 @@ def _to_hinglish(text: str) -> str:
                 "(e.g. 'PM Kisan', 'Pradhan Mantri', 'PMAY', 'Ayushman Bharat').\n"
                 "2. Translate only the surrounding explanation to colloquial Hindi in Roman script.\n"
                 "3. No Devanagari characters at all.\n"
-                "4. Output only the translation, nothing else.\n\n"
+                "4. Output only the translation, nothing else.\n"
+                "5. Use this domain glossary for key terms:\n"
+                "   scheme/yojana → 'yojana', government → 'sarkar', eligibility → 'patrata',\n"
+                "   benefit → 'laabh', application → 'aavedan', ministry → 'mantralaya',\n"
+                "   farmer → 'kisan', subsidy → 'subsidy', loan → 'loan', amount → 'rashi'.\n\n"
                 f"{text}"
             )}],
             stream=False,
@@ -783,6 +788,7 @@ def _to_hinglish(text: str) -> str:
             result = result.split("</think>", 1)[-1].strip()
         if re.search(r'[ऀ-ॿ]', result):
             return text
+        print(f"[hinglish] out='{result[:120]}'")
         return result or text
     except Exception:
         return text
