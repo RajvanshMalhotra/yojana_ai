@@ -152,7 +152,7 @@ def _normalize_for_tts(text: str) -> str:
     text = re.sub(r'`(.+?)`', r'\1', text, flags=re.DOTALL)       # `code`
     text = re.sub(r'^\s*[-*•]\s+', '', text, flags=re.MULTILINE)  # bullet points
     text = re.sub(r'\n+', ' ', text)                               # newlines → space
-    text = re.sub(r'[ऀ-ॿ]+', '', text)                   # strip stray Devanagari
+    # Devanagari left intact — Rumik Mulberry handles it natively
     text = _CITE_RE.sub('', text)       # strip citation markers [1], [W2]
 
     # Expand common government scheme acronyms so TTS pronounces them naturally
@@ -757,56 +757,19 @@ async def voice_stt(request: Request, lang: str | None = Query(None)):
     return JSONResponse({"transcript": transcript})
 
 
-def _to_hinglish(text: str) -> str:
-    """Translate English text to Hinglish (Hindi in Roman/Latin script) for TTS.
-    Called only when lang=hi so Rumik speaks Hindi."""
-    client = _state.get("draft_client")
-    model  = _state.get("draft_model", "llama-3.1-8b-instant")
-    if not client:
-        return text
-    try:
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": (
-                "Translate this English text to Hinglish (Hindi in Roman/Latin script). Rules:\n"
-                "1. Keep ALL scheme names, abbreviations and proper nouns exactly as-is "
-                "(e.g. 'PM Kisan', 'Pradhan Mantri', 'PMAY', 'Ayushman Bharat').\n"
-                "2. Translate only the surrounding explanation to colloquial Hindi in Roman script.\n"
-                "3. No Devanagari characters at all.\n"
-                "4. Output only the translation, nothing else.\n\n"
-                f"{text}"
-            )}],
-            stream=False,
-            max_tokens=min(len(text) * 3, 1000),
-        )
-        result = resp.choices[0].message.content.strip()
-        if "</think>" in result:
-            result = result.split("</think>", 1)[-1].strip()
-        if re.search(r'[ऀ-ॿ]', result):
-            return text  # fallback to English if model still returned Devanagari
-        return result or text
-    except Exception:
-        return text
-
-
 @app.post("/api/voice/tts")
 async def voice_tts(request: Request):
-    """Convert text to speech via Rumik Mulberry — returns WAV audio."""
+    """Convert text to speech via Rumik Mulberry — returns WAV audio.
+    Mulberry handles both English and Devanagari natively; no translation needed."""
     import requests as _req
     body = await request.json()
     text = (body.get("text") or "").strip()
-    lang = body.get("lang", "en")
     if not text:
         return JSONResponse({"error": "empty_text"}, status_code=400)
 
     rumik_key = os.environ.get("RUMIK_API_KEY")
     if not rumik_key:
         return JSONResponse({"error": "rumik_not_configured"}, status_code=503)
-
-    # For Hindi: translate English → Hinglish so Rumik speaks in Hindi
-    if lang == "hi":
-        loop = asyncio.get_running_loop()
-        text = await loop.run_in_executor(None, _to_hinglish, text)
 
     clean = _normalize_for_tts(text)
     if not clean:
