@@ -1,8 +1,10 @@
 __pycache__/
 *.pyc
 .env
-data/
-*.pkl
+data/human_nutrition.pdf
+data/index.faiss
+data/chunks.pkl
+data/schemes.json
 node_modules/
 frontend/dist/
 .superpowers/
