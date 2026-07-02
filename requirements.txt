@@ -15,3 +15,6 @@ ddgs
 firecrawl-py
 deepgram-sdk
 cartesia
+google-genai
+groq
+sarvamai
