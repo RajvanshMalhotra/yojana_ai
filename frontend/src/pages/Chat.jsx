@@ -149,43 +149,74 @@ export default function Chat() {
 
     let fullAnswer = ''
 
-    // Sentence-streaming TTS: fire a TTS request per sentence as tokens arrive,
-    // play them sequentially so audio starts before generation finishes.
-    let ttsBuf = ''
+    // Sentence-streaming TTS:
+    //   First chunk fires at 80 chars so audio starts with minimal lag.
+    //   Subsequent chunks fire at 200 chars so each plays long enough for the
+    //   next Rumik request to resolve before it's needed (gap-free playback).
+    let ttsBuf      = ''   // within-sentence token buffer
+    let ttsAccum    = ''   // complete-sentence accumulator
+    let ttsFirstSent = false  // lower threshold for the very first TTS call
     const ttsQueue = []
     let ttsPlaying = false
 
+    // Each entry = { blob: Blob|null, promise: Promise<Blob> }
+    // Blob is cached as soon as the fetch resolves so advanceTTS plays instantly with zero wait.
     function advanceTTS() {
       if (ttsQueue.length === 0) { ttsPlaying = false; setVoiceAudioState('paused'); return }
       ttsPlaying = true
-      ttsQueue.shift()
-        .then(blob => {
-          if (voiceAudioRef.current) {
-            voiceAudioRef.current.pause()
-            if (voiceAudioRef.current._url) URL.revokeObjectURL(voiceAudioRef.current._url)
-          }
-          const url = URL.createObjectURL(blob)
-          const audio = new Audio(url)
-          audio._url = url
-          voiceAudioRef.current = audio
-          setVoiceAudioState('playing')
-          audio.onended = () => advanceTTS()
-          audio.onerror = () => { URL.revokeObjectURL(url); advanceTTS() }
-          audio.play()
-        })
-        .catch(() => advanceTTS())
+      const entry = ttsQueue.shift()
+
+      const playBlob = (blob) => {
+        if (!blob) { advanceTTS(); return }
+        if (voiceAudioRef.current) {
+          voiceAudioRef.current.pause()
+          if (voiceAudioRef.current._url) URL.revokeObjectURL(voiceAudioRef.current._url)
+        }
+        const url = URL.createObjectURL(blob)
+        const audio = new Audio(url)
+        audio._url = url
+        voiceAudioRef.current = audio
+        setVoiceAudioState('playing')
+        audio.onended = () => advanceTTS()
+        audio.onerror  = () => { URL.revokeObjectURL(url); advanceTTS() }
+        audio.play()
+      }
+
+      // If blob already cached (resolved while previous sentence was playing) → zero gap
+      if (entry.blob) {
+        playBlob(entry.blob)
+      } else {
+        entry.promise.then(playBlob).catch(() => advanceTTS())
+      }
     }
 
     function enqueueTTS(sentence) {
       if (!sentence.trim()) return
-      ttsQueue.push(
-        fetch('/api/voice/tts', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ text: sentence.trim(), lang: lang || 'en' }),
-        }).then(r => r.ok ? r.blob() : Promise.reject(r.status))
-      )
+      const entry = { blob: null, promise: null }
+      entry.promise = fetch('/api/voice/tts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: sentence.trim(), lang: lang || 'en' }),
+      })
+        .then(r => r.ok ? r.blob() : Promise.reject(r.status))
+        .then(blob => { entry.blob = blob; return blob })
+        .catch(() => null)
+      ttsQueue.push(entry)
       if (!ttsPlaying) advanceTTS()
+    }
+
+    // Split text longer than 250 chars at word boundaries before enqueueing.
+    // Prevents sending multi-thousand-char chunks to Rumik (causes timeouts).
+    function enqueueTTSText(text) {
+      const MAX = 250
+      let t = text.trim()
+      while (t.length > MAX) {
+        let split = t.lastIndexOf(' ', MAX)
+        if (split < 0) split = MAX
+        enqueueTTS(t.slice(0, split).trim())
+        t = t.slice(split).trim()
+      }
+      if (t) enqueueTTS(t)
     }
 
     try {
@@ -233,11 +264,23 @@ export default function Chat() {
             fullAnswer += evt.content
             if (isVoice) {
               ttsBuf += evt.content
-              // Fire TTS when a sentence boundary is detected
-              const m = ttsBuf.match(/^([\s\S]*?[.!?])(\s+[\s\S]*)?$/)
-              if (m) {
-                enqueueTTS(m[1])
-                ttsBuf = m[2] || ''
+              // Drain all complete sentences from ttsBuf (while loop handles
+              // multiple sentence-endings arriving in a single token batch)
+              let sm
+              while ((sm = /^([\s\S]*?[.!?])\s+([\s\S]*)$/.exec(ttsBuf))) {
+                ttsAccum += (ttsAccum ? ' ' : '') + sm[1]
+                ttsBuf = sm[2]
+              }
+              const threshold = ttsFirstSent ? 200 : 80
+              if (ttsAccum.length >= threshold) {
+                enqueueTTSText(ttsAccum)
+                ttsAccum = ''
+                ttsFirstSent = true
+              } else if (ttsBuf.length > 300) {
+                // Safety: no sentence boundary found but buffer is growing — flush raw
+                enqueueTTSText(ttsBuf.trim())
+                ttsBuf = ''
+                ttsFirstSent = true
               }
             }
             setMessages(prev => {
@@ -256,8 +299,12 @@ export default function Chat() {
         }
       }
 
-      // Flush any remaining partial sentence
-      if (isVoice && ttsBuf.trim()) enqueueTTS(ttsBuf)
+      // Flush any remaining accumulated sentences + partial sentence, split into
+      // ≤250-char chunks so Rumik doesn't timeout on a large final flush.
+      if (isVoice) {
+        const remaining = (ttsAccum + (ttsBuf.trim() ? ' ' + ttsBuf.trim() : '')).trim()
+        if (remaining) enqueueTTSText(remaining)
+      }
     } catch {
       setMessages(prev => {
         const msgs = [...prev]

@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import time as _time
 import numpy as np
 
 # Queries that contain personal pronouns, relational nouns, or vague intent words
@@ -207,10 +208,21 @@ Generate exactly {self.max_expanded_queries} diverse rephrasing of the user's qu
         return self._pinecone_query(embedding, filters, top_k)
 
     def _pinecone_query(self, embedding: list, filters: dict | None, top_k: int) -> list[dict]:
-        """Thread-safe: pure Pinecone network call, no tokenization."""
-        results = self.index.query(
-            vector=embedding, filter=filters, top_k=top_k, include_metadata=True,
-        )
+        """Thread-safe: pure Pinecone network call, no tokenization.
+        Retries once on transient gRPC h2 errors (stale connection after reload)."""
+        import time as _time
+        for attempt in range(2):
+            try:
+                results = self.index.query(
+                    vector=embedding, filter=filters, top_k=top_k, include_metadata=True,
+                )
+                break
+            except Exception as e:
+                if attempt == 0:
+                    print(f"[pinecone] transient error, retrying: {e}")
+                    _time.sleep(0.5)
+                    continue
+                raise
         chunks = []
         for match in results["matches"]:
             chunk = match["metadata"].copy()
@@ -258,8 +270,7 @@ Generate exactly {self.max_expanded_queries} diverse rephrasing of the user's qu
         return results
 
     def web_search(self, query: str, n: int = 4) -> list[dict]:
-        """Firecrawl search — returns [{title, snippet, url, content?}, …] or [] on failure.
-        Scrapes full content from the top result so the LLM has rich context, not just snippets."""
+        """Firecrawl search — returns [{title, snippet, url}, …] or [] on failure."""
         try:
             from firecrawl import FirecrawlApp
             app = FirecrawlApp(api_key=os.environ["FIRECRAWL_API_KEY"])
@@ -267,29 +278,10 @@ Generate exactly {self.max_expanded_queries} diverse rephrasing of the user's qu
             data = app.search(search_query, limit=n)
             hits = data.web or []
             print(f"[web] query='{search_query[:60]}'  hits={len(hits)}")
-            results = []
-            for i, r in enumerate(hits):
-                entry = {
-                    "title":   r.title or "",
-                    "snippet": r.description or "",
-                    "url":     r.url or "",
-                }
-                if i == 0 and entry["url"]:
-                    try:
-                        import concurrent.futures as _cf
-                        with _cf.ThreadPoolExecutor(max_workers=1) as _ex:
-                            _fut = _ex.submit(app.scrape_url, entry["url"], formats=["markdown"])
-                            try:
-                                scraped = _fut.result(timeout=5)
-                                if scraped and scraped.markdown:
-                                    entry["content"] = scraped.markdown[:5000]
-                                    print(f"[web] scraped {len(entry['content'])} chars from {entry['url'][:60]}")
-                            except _cf.TimeoutError:
-                                print(f"[web] scrape timed out, skipping")
-                    except Exception as e:
-                        print(f"[web] scrape failed: {e}")
-                results.append(entry)
-            return results
+            return [
+                {"title": r.title or "", "snippet": r.description or "", "url": r.url or ""}
+                for r in hits
+            ]
         except Exception as e:
             print(f"[web] search failed: {e}")
             return []
@@ -399,7 +391,7 @@ Return ONLY a raw JSON object — no markdown, no explanation:
                 pass
         return {}, query, query, []
 
-    def retrieve(self, query: str, recent_messages: list = [], fast: bool = False) -> list[dict]:
+    def retrieve(self, query: str, recent_messages: list = [], fast: bool = False, n_web: int = 0) -> list[dict]:
         """
         Full retrieval pipeline — one LLM call handles parse + rewrite + step-back + expand,
         then parallel hybrid search and rerank.
@@ -414,11 +406,15 @@ Return ONLY a raw JSON object — no markdown, no explanation:
             queries = [rewritten]
             self.last_step_back_query = rewritten
             self.last_is_complex = False  # always route to 7B in voice mode
+            self.last_web_results = []
             print(f"[fast] rewritten='{rewritten[:80]}'")
 
             candidates = self.multi_query_retrieval(queries, None)
         elif self.use_query_rewrite or self.use_multi_query or self.use_step_back:
+            _t0 = _time.perf_counter()
             filters_raw, rewritten, step_back, expanded = self._parse_rewrite_expand(query, recent_messages)
+            print(f"[ret] parse_rewrite_expand={_time.perf_counter()-_t0:.2f}s")
+
             filters = self._build_pinecone_filter(filters_raw)
 
             primary = rewritten if self.use_query_rewrite else query
@@ -434,12 +430,17 @@ Return ONLY a raw JSON object — no markdown, no explanation:
             print(f"Filters   : {filters}")
             print(f"Step-back : {queries[0] if self.use_step_back else '(off)'}")
             print(f"Primary   : {queries[0] if not self.use_step_back else queries[1] if len(queries) > 1 else '—'}")
+            print(f"[ret] {len(queries)} queries to embed+search")
 
-            with ThreadPoolExecutor(max_workers=2) as pool:
+            _t1 = _time.perf_counter()
+            with ThreadPoolExecutor(max_workers=3) as pool:
                 search_fut   = pool.submit(self.multi_query_retrieval, queries, filters)
                 classify_fut = pool.submit(self._classify_complexity, query)
+                web_fut      = pool.submit(self.web_search, primary, n_web) if n_web > 0 else None
                 candidates   = search_fut.result()
                 is_complex   = classify_fut.result()
+                self.last_web_results = web_fut.result() if web_fut else []
+            print(f"[ret] embed+pinecone+classify+web={_time.perf_counter()-_t1:.2f}s")
 
             self.last_is_complex = is_complex
             print(f"Complex   : {is_complex}")
@@ -448,6 +449,7 @@ Return ONLY a raw JSON object — no markdown, no explanation:
             filters = self._build_pinecone_filter(filters_raw)
             queries = [query]
             self.last_step_back_query = query
+            self.last_web_results = []
             print(f"Filters   : {filters}")
 
             with ThreadPoolExecutor(max_workers=2) as pool:

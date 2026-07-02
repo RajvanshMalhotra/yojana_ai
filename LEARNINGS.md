@@ -142,3 +142,79 @@ First audio starts playing ~2s after first token, before generation even finishe
 Firecrawl returned US NSF, US Executive Orders, Google Cloud programs for "Government schemes for AI startups".
 Fix: append `" India"` to every Firecrawl query (not `" India government"` — that over-constrains and returns generic results).
 `country=` kwarg not supported by the installed Firecrawl SDK version — raises `TypeError`.
+
+---
+
+## Hindi Query Pipeline Overhaul (2026-07-03)
+
+### Problem 1: Sequential retrieval + web search for Hindi queries
+
+**Before:**
+```python
+# server.py /api/chat
+if req.lang == "hi":
+    chunks_raw = await loop.run_in_executor(None, lambda: retriever.retrieve(req.message))
+    english_query = getattr(retriever, "last_step_back_query", req.message)
+    web_candidates = await loop.run_in_executor(None, retriever.web_search, english_query, n_web)
+else:
+    retrieval_task = loop.run_in_executor(None, lambda: retriever.retrieve(req.message))
+    web_task = loop.run_in_executor(None, retriever.web_search, req.message, n_web)
+    chunks_raw, web_candidates = await asyncio.gather(retrieval_task, web_task)
+```
+
+**Root cause:** Hindi queries needed the English `step_back_query` (produced inside `retrieve()` by `_parse_rewrite_expand`) to avoid sending raw Devanagari to Firecrawl. Since `step_back_query` was only available *after* `retrieve()` returned, web search had to be sequential. This added the full web search latency (~0.5–1s) on top of retrieval.
+
+**Fix:** Move `web_search` inside `retrieve()` itself — after `_parse_rewrite_expand` yields `step_back`, launch web search in the same `ThreadPoolExecutor` as `multi_query_retrieval` and `_classify_complexity`:
+
+```python
+# retrieval.py retrieve(query, n_web=0)
+with ThreadPoolExecutor(max_workers=3) as pool:
+    search_fut   = pool.submit(self.multi_query_retrieval, queries, filters)
+    classify_fut = pool.submit(self._classify_complexity, query)
+    web_fut      = pool.submit(self.web_search, step_back, n_web) if n_web > 0 else None
+    candidates   = search_fut.result()
+    is_complex   = classify_fut.result()
+    self.last_web_results = web_fut.result() if web_fut else []
+```
+
+Server now calls `retriever.retrieve(query, n_web=n_web)` then reads `retriever.last_web_results` — identical path for Hindi and English, no branching.
+
+**Result:** Retrieval + classification + web search all finish together. `embed+pinecone+classify+web=2.82s`, `pipeline_total=4.66s`.
+
+---
+
+### Problem 2: Web scrape timing out every single time
+
+**Before:**
+```python
+# After getting search results, scraped the top URL for full page content
+_fut = _ex.submit(app.scrape_url, entry["url"], formats=["markdown"])
+scraped = _fut.result(timeout=4)   # always hit this
+```
+
+**Root cause:** `scrape_url` was added to give the LLM richer context than just the search snippet. But it consistently timed out (tried 5s, 10s, 4s — always failed). Every web search call silently wasted 4 seconds and produced nothing.
+
+**Fix:** Removed the scrape entirely. Firecrawl's `search()` already returns a `description` snippet per result which is sufficient for the LLM to synthesise an answer. The scrape was a never-working optimisation.
+
+```python
+# Now:
+return [
+    {"title": r.title or "", "snippet": r.description or "", "url": r.url or ""}
+    for r in hits
+]
+```
+
+---
+
+### Problem 3: Romanization model too slow (70B) and Hindi output breaking TTS
+
+**Before:** `_romanize_hinglish()` hardcoded `model="llama-3.3-70b-versatile"` regardless of what was passed in. 70B on Groq is rate-limited and slower than 8B.
+
+**Root cause:** 8B was tried first for romanization but failed (returned Devanagari). 70B was hardcoded as a workaround. The passed `model` argument was silently ignored.
+
+**Fix:** Use the passed `model` argument (which is `draft_model = llama-3.1-8b-instant`). User confirmed 8B works fine for romanization on Groq playground. The system prompt change (`"Always respond in English."`) means the LLM usually outputs English anyway — romanization only catches the rare Devanagari fallback.
+
+**Also removed:**
+- `_HINDI_LANG_RULE` constant (heavy script-enforcement block in system prompt — unreliable, caused model confusion)
+- Pre-commit trick (fake user/assistant turns to prime Roman script — added token overhead, still failed)
+- Sequential Hindi branch in `/api/voice` (now uses same unified `retrieve(n_web=n_web)` path)

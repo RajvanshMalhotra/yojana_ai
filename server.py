@@ -138,8 +138,36 @@ def _indian_words(n: int) -> str:
     return " ".join(parts)
 
 def _normalize_for_tts(text: str) -> str:
-    """Clean text before sending to Cartesia so numbers are spoken correctly."""
-    text = _CITE_RE.sub('', text)       # strip citation markers
+    """Clean text before sending to TTS: strip markdown and normalise numbers."""
+    # Strip markdown formatting (model sometimes ignores the no-markdown instruction)
+    text = re.sub(r'#{1,6}\s+', '', text)                         # ## Headers
+    text = re.sub(r'\*\*(.+?)\*\*', r'\1', text, flags=re.DOTALL) # **bold**
+    text = re.sub(r'\*(.+?)\*', r'\1', text, flags=re.DOTALL)     # *italic*
+    text = re.sub(r'`(.+?)`', r'\1', text, flags=re.DOTALL)       # `code`
+    text = re.sub(r'^\s*[-*•]\s+', '', text, flags=re.MULTILINE)  # bullet points
+    text = re.sub(r'\n+', ' ', text)                               # newlines → space
+    text = re.sub(r'[ऀ-ॿ]+', '', text)                   # strip stray Devanagari
+    text = _CITE_RE.sub('', text)       # strip citation markers [1], [W2]
+
+    # Expand common government scheme acronyms so TTS pronounces them naturally
+    _ACRONYMS = {
+        r'\bPMAY\b': 'Pradhan Mantri Awaas Yojana',
+        r'\bPMKVY\b': 'Pradhan Mantri Kaushal Vikas Yojana',
+        r'\bPMFBY\b': 'Pradhan Mantri Fasal Bima Yojana',
+        r'\bPMJDY\b': 'Pradhan Mantri Jan Dhan Yojana',
+        r'\bPMGSY\b': 'Pradhan Mantri Gram Sadak Yojana',
+        r'\bMGNREGA\b': 'Mahatma Gandhi National Rural Employment Guarantee Act',
+        r'\bMGNEGS\b': 'Mahatma Gandhi National Employment Guarantee Scheme',
+        r'\bPMMY\b': 'Pradhan Mantri Mudra Yojana',
+        r'\bNSP\b': 'National Scholarship Portal',
+        r'\bWEP\b': 'Women Entrepreneurship Platform',
+        r'\bSTARTUP\s+INDIA\b': 'Startup India',
+        r'\bSTAND-?UP\s+INDIA\b': 'Stand Up India',
+        r'\bTREAD\b': 'Trade Related Entrepreneurship Assistance and Development',
+        r'\bDPIT\b': 'Department for Promotion of Industry and Internal Trade',
+    }
+    for pattern, replacement in _ACRONYMS.items():
+        text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
 
     def _cur(m):
         try:
@@ -190,10 +218,6 @@ def _build_prompt(query: str, chunks: list[dict], web_results: list[dict] = []) 
 
 def _build_messages(prompt: str, recent_msgs: list, summary: str,
                     has_web: bool = False, lang: str | None = None) -> list[dict]:
-    lang_instr = (
-        " Respond entirely in Hindi using Devanagari script. Do not use English."
-        if lang == "hi" else ""
-    )
     if has_web:
         system = (
             "You are Yojan AI, an expert on Indian government schemes. "
@@ -202,8 +226,8 @@ def _build_messages(prompt: str, recent_msgs: list, summary: str,
             "Use WEB RESULTS to enrich, add current details, or fill gaps — cite as [W1], [W2] etc. "
             "Synthesise both naturally into a single flowing answer. "
             "Do not invent scheme names, benefit amounts, or eligibility criteria not present in either source. "
-            "Do NOT use markdown, bullet points, or headers — plain flowing text only."
-            + lang_instr
+            "Do NOT use markdown, bullet points, or headers — plain flowing text only. "
+            "Always respond in English."
         )
     else:
         system = (
@@ -211,14 +235,19 @@ def _build_messages(prompt: str, recent_msgs: list, summary: str,
             "Use the CONTEXT (verified scheme database) to answer. Cite schemes as [1], [2] etc. "
             "Do not invent scheme names, benefit amounts, or eligibility criteria not present in the CONTEXT. "
             "If no scheme in the context directly matches, say so and describe the closest relevant ones. "
-            "Do NOT use markdown, bullet points, or headers — plain flowing text only."
-            + lang_instr
+            "Do NOT use markdown, bullet points, or headers — plain flowing text only. "
+            "Always respond in English."
         )
     messages = [{"role": "system", "content": system}]
     if summary:
         messages.append({"role": "user", "content": f"Conversation summary so far: {summary}"})
     messages.extend(recent_msgs)
-    messages.append({"role": "user", "content": prompt})
+
+    if lang == "hi":
+        messages.append({"role": "user", "content": prompt + "\n\n(Roman script mein jawab dena — Devanagari mat likhna.)"})
+    else:
+        messages.append({"role": "user", "content": prompt})
+
     return messages
 
 
@@ -370,6 +399,34 @@ def _sse(payload: dict) -> str:
     return f"data: {json.dumps(payload)}\n\n"
 
 
+def _romanize_hinglish(text: str, client, model: str) -> str:
+    """Convert Devanagari Hindi to Romanized Hinglish via one LLM call."""
+    if not re.search(r'[ऀ-ॿ]', text):
+        return text
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "user", "content": (
+                    "convert this to romanised hinglish (latin script). "
+                    "example: write kaise ho, not कैसे हो.\n\n" + text
+                )},
+            ],
+            stream=False,
+            max_tokens=min(len(text) * 3, 2000),
+        )
+        result = resp.choices[0].message.content.strip()
+        if "</think>" in result:
+            result = result.split("</think>", 1)[-1].strip()
+        # If the model still returned Devanagari, return original so the caller can
+        # handle it (strip entirely) rather than sending garbled punctuation to TTS.
+        if re.search(r'[ऀ-ॿ]', result):
+            return text
+        return result or text
+    except Exception:
+        return text
+
+
 def _generate_answer(messages: list, active_client, max_tokens: int, model: str | None = None) -> str:
     """Run LLM and accumulate full answer (strips CoT <think> blocks)."""
     buffer = ""
@@ -440,13 +497,11 @@ async def chat(req: ChatRequest):
     t_retrieval_start = time.perf_counter()
     if use_agentic:
         n_web = config.get("agentic_web_results", 4)
-        retrieval_task = loop.run_in_executor(
-            None, lambda: retriever.retrieve(req.message, recent_messages=recent_msgs)
+        chunks_raw = await loop.run_in_executor(
+            None, lambda: retriever.retrieve(req.message, recent_messages=recent_msgs, n_web=n_web)
         )
-        web_task = loop.run_in_executor(None, retriever.web_search, req.message, n_web)
-        chunks_raw, web_candidates = await asyncio.gather(retrieval_task, web_task)
         unique_chunks = _dedup_by_title(chunks_raw)
-        web_results = web_candidates
+        web_results = getattr(retriever, "last_web_results", [])
     else:
         chunks_raw = await loop.run_in_executor(
             None, lambda: retriever.retrieve(req.message, recent_messages=recent_msgs)
@@ -468,7 +523,8 @@ async def chat(req: ChatRequest):
     prompt   = _build_prompt(req.message, unique_chunks, web_results)
     messages = _build_messages(prompt, recent_msgs, summary, has_web=bool(web_results), lang=req.lang)
 
-    # Speculative routing: use fast draft model for simple queries, full model for complex
+    # Standard routing: Groq 8B for simple, featherless 72B for complex.
+    # Hindi responses are romanized post-generation so model choice doesn't affect script.
     is_complex    = getattr(retriever, "last_is_complex", True)
     active_client = gen_client if is_complex else _state["draft_client"]
     active_model  = _state["gen_model"] if is_complex else _state["draft_model"]
@@ -509,15 +565,22 @@ async def chat(req: ChatRequest):
                     after = buffer.split("</think>", 1)[-1].lstrip("\n").strip()
                     if after:
                         full_answer += after
-                        yield _sse({"type": "token", "content": after})
             else:
                 full_answer += token
-                yield _sse({"type": "token", "content": token})
 
         # Model didn't emit </think> — buffer is the answer
         if not thinking_done and buffer:
             full_answer = buffer
-            yield _sse({"type": "token", "content": buffer})
+
+        # For Hindi: romanize Devanagari → Latin script before streaming to frontend.
+        # This is more reliable than hoping the LLM outputs Roman script directly.
+        if req.lang == "hi" and _state.get("draft_client"):
+            full_answer = _romanize_hinglish(full_answer, _state["draft_client"], _state["draft_model"])
+
+        # Stream the (possibly romanized) answer token by token
+        CHUNK = 12
+        for i in range(0, len(full_answer), CHUNK):
+            yield _sse({"type": "token", "content": full_answer[i:i+CHUNK]})
 
         t_total_gen = time.perf_counter() - t_gen_start
         ttft = round(t_first_token, 2) if t_first_token is not None else None
@@ -606,16 +669,13 @@ async def voice_chat(request: Request, lang: str | None = Query(None)):
         recent_msgs = memory.get_recent([])
         summary = memory.summarize([]) if memory.should_compress() else ""
 
-    # Parallel retrieval + web search (mirrors /api/chat agentic path)
-    # Full retrieval pipeline (same as /api/chat). Web runs in parallel.
     t_ret_start = time.perf_counter()
     n_web = config.get("agentic_web_results", 4)
-    chunks_raw, web_candidates = await asyncio.gather(
-        loop.run_in_executor(None, lambda: retriever.retrieve(transcript, recent_messages=recent_msgs)),
-        loop.run_in_executor(None, retriever.web_search, transcript, n_web),
+    chunks_raw = await loop.run_in_executor(
+        None, lambda: retriever.retrieve(transcript, recent_messages=recent_msgs, n_web=n_web)
     )
     unique_chunks = _dedup_by_title(chunks_raw)
-    web_results   = web_candidates
+    web_results   = getattr(retriever, "last_web_results", [])
     t_ret = time.perf_counter() - t_ret_start
     print(f"[voice] retrieval={t_ret:.2f}s  chunks={len(unique_chunks)}  web={len(web_results)}")
 
@@ -638,6 +698,10 @@ async def voice_chat(request: Request, lang: str | None = Query(None)):
         None, lambda: _generate_answer(msgs, active_client, max_tokens, model=active_model)
     )
     t_gen = time.perf_counter() - t_gen_start
+
+    if lang == "hi" and _state.get("draft_client"):
+        answer = _romanize_hinglish(answer, _state["draft_client"], _state["draft_model"])
+
     completion_tokens = len(answer.split())
     print(
         f"[voice] model={model_label}  "
@@ -660,7 +724,7 @@ async def voice_chat(request: Request, lang: str | None = Query(None)):
 
 @app.post("/api/voice/stt")
 async def voice_stt(request: Request, lang: str | None = Query(None)):
-    """STT only — transcribe audio and return transcript. Generation handled by /api/chat."""
+    """STT only — transcribe audio via Sarvam saaras:v3 and return transcript."""
     audio_bytes = await request.body()
     if not audio_bytes:
         return JSONResponse({"error": "no_audio"}, status_code=400)
@@ -696,81 +760,51 @@ async def voice_stt(request: Request, lang: str | None = Query(None)):
 
 @app.post("/api/voice/tts")
 async def voice_tts(request: Request):
-    """Convert text to speech via Sarvam AI — returns WAV audio."""
-    import base64, requests as _req
+    """Convert text to speech via Rumik Silk (muga model, happy tone) — returns WAV audio."""
+    import requests as _req
     body = await request.json()
     text = (body.get("text") or "").strip()
-    lang = (body.get("lang") or "en")
     if not text:
         return JSONResponse({"error": "empty_text"}, status_code=400)
 
-    sarvam_key = os.environ.get("SARVAM_API_KEY")
-    if not sarvam_key:
-        return JSONResponse({"error": "sarvam_not_configured"}, status_code=503)
+    rumik_key = os.environ.get("RUMIK_API_KEY")
+    if not rumik_key:
+        return JSONResponse({"error": "rumik_not_configured"}, status_code=503)
 
-    target_lang = "hi-IN" if lang == "hi" else "en-IN"
     clean = _normalize_for_tts(text)
     if not clean:
         return JSONResponse({"error": "empty_after_normalisation"}, status_code=400)
 
-    # Split into ≤500-char chunks at sentence boundaries for Sarvam's per-input limit
-    def _chunk_text(t: str, limit: int = 500) -> list[str]:
-        import re as _re
-        sentences = _re.split(r'(?<=[.!?])\s+', t)
-        chunks, buf = [], ""
-        for s in sentences:
-            if len(buf) + len(s) + 1 <= limit:
-                buf = (buf + " " + s).strip() if buf else s
-            else:
-                if buf:
-                    chunks.append(buf)
-                buf = s[:limit]  # hard-truncate pathological single sentences
-        if buf:
-            chunks.append(buf)
-        return chunks or [t[:limit]]
-
-    chunks = _chunk_text(clean)
+    # Rumik 2000-char limit; frontend sends ≤250-char chunks so this is a safety cap.
+    payload_text = clean[:450]
     loop = asyncio.get_running_loop()
 
-    def _call_sarvam():
-        import struct
-        # Sarvam allows max 3 inputs per call — batch into groups of 3
-        batches = [chunks[i:i+3] for i in range(0, len(chunks), 3)]
-        all_audios = []
-        for batch in batches:
-            resp = _req.post(
-                "https://api.sarvam.ai/text-to-speech",
-                headers={"api-subscription-key": sarvam_key},
-                json={
-                    "inputs": batch,
-                    "target_language_code": target_lang,
-                    "speaker": "suhani",
-                    "model": "bulbul:v3",
-                    "pace": 1.1,
-                    "enable_preprocessing": True,
-                },
-                timeout=30,
-            )
-            if not resp.ok:
-                print(f"[tts] sarvam error: {resp.text[:500]}")
-            resp.raise_for_status()
-            all_audios.extend(base64.b64decode(a) for a in resp.json()["audios"])
-
-        if len(all_audios) == 1:
-            return all_audios[0]
-        # Concatenate WAV: full header from first, raw PCM from rest
-        WAV_HEADER = 44
-        pcm = b''.join(a[WAV_HEADER:] for a in all_audios)
-        hdr = bytearray(all_audios[0][:WAV_HEADER])
-        total_data = len(pcm)
-        struct.pack_into('<I', hdr, 4, 36 + total_data)
-        struct.pack_into('<I', hdr, 40, total_data)
-        return bytes(hdr) + pcm
+    def _call_rumik():
+        print(f"[tts] rumik request: model=mulberry  chars={len(payload_text)}  text='{payload_text[:60]}'")
+        resp = _req.post(
+            "https://silk-api.rumik.ai/v1/tts",
+            headers={
+                "Authorization": f"Bearer {rumik_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": "mulberry",
+                "text": payload_text,
+                "speaker": "speaker_3",
+                "description": "A 30-year-old Indian female voice with a confident and energetic tone, suitable for an ad narrator.",
+            },
+            timeout=20,
+        )
+        print(f"[tts] status={resp.status_code}  content-type={resp.headers.get('content-type')}")
+        if not resp.ok:
+            print(f"[tts] rumik error body: {resp.text[:500]}")
+        resp.raise_for_status()
+        return resp.content  # direct WAV bytes, no base64
 
     try:
-        audio_bytes = await loop.run_in_executor(None, _call_sarvam)
+        audio_bytes = await loop.run_in_executor(None, _call_rumik)
     except Exception as exc:
-        print(f"[tts] error: {exc}")
+        print(f"[tts] exception: {exc}")
         return JSONResponse({"error": str(exc)}, status_code=500)
 
     return StreamingResponse(
@@ -831,10 +865,6 @@ async def voice_ws(websocket: WebSocket, lang: str | None = Query(None)):
         ),
     )
 
-    if lang == "hi":
-        lang_instr = " Respond entirely in Hindi using Devanagari script. Do not use any other language."
-    else:
-        lang_instr = " Always respond in English only. Never use any other language."
     system_content = (
         "You are Yojan AI, an expert on Indian government schemes. "
         "The CONTEXT contains verified scheme data. Use it — every scheme listed is real and available. "
@@ -842,8 +872,8 @@ async def voice_ws(websocket: WebSocket, lang: str | None = Query(None)):
         "Do not invent scheme names, amounts, or eligibility details not present in the CONTEXT. "
         "Lead with the most relevant scheme, then mention 1-2 others. "
         "This is a voice conversation — speak naturally, no bullet points, no markdown, no citations. "
-        "Aim for 4-5 sentences."
-        + lang_instr
+        "Aim for 4-5 sentences. "
+        "Always respond in English only. Never use any other language."
     )
 
     context     = LLMContext(messages=[{"role": "system", "content": system_content}])
