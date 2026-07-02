@@ -475,7 +475,12 @@ def _judge(chunks: list[dict], query: str) -> str:
 
 
 
-# ── Route ─────────────────────────────────────────────────────────────────────
+# ── Routes ────────────────────────────────────────────────────────────────────
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
 
 @app.post("/api/chat")
 async def chat(req: ChatRequest):
