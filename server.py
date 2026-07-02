@@ -249,10 +249,7 @@ def _build_messages(prompt: str, recent_msgs: list, summary: str,
         messages.append({"role": "user", "content": f"Conversation summary so far: {summary}"})
     messages.extend(recent_msgs)
 
-    if lang == "hi":
-        messages.append({"role": "user", "content": prompt + "\n\n(Roman script mein jawab dena — Devanagari mat likhna.)"})
-    else:
-        messages.append({"role": "user", "content": prompt})
+    messages.append({"role": "user", "content": prompt})
 
     return messages
 
@@ -535,7 +532,6 @@ async def chat(req: ChatRequest):
     messages = _build_messages(prompt, recent_msgs, summary, has_web=bool(web_results), lang=req.lang)
 
     # Standard routing: Groq 8B for simple, featherless 72B for complex.
-    # Hindi responses are romanized post-generation so model choice doesn't affect script.
     is_complex    = getattr(retriever, "last_is_complex", True)
     active_client = gen_client if is_complex else _state["draft_client"]
     active_model  = _state["gen_model"] if is_complex else _state["draft_model"]
@@ -583,12 +579,7 @@ async def chat(req: ChatRequest):
         if not thinking_done and buffer:
             full_answer = buffer
 
-        # For Hindi: romanize Devanagari → Latin script before streaming to frontend.
-        # This is more reliable than hoping the LLM outputs Roman script directly.
-        if req.lang == "hi" and _state.get("draft_client"):
-            full_answer = _romanize_hinglish(full_answer, _state["draft_client"], _state["draft_model"])
-
-        # Stream the (possibly romanized) answer token by token
+        # Stream answer token by token
         CHUNK = 12
         for i in range(0, len(full_answer), CHUNK):
             yield _sse({"type": "token", "content": full_answer[i:i+CHUNK]})
@@ -709,9 +700,6 @@ async def voice_chat(request: Request, lang: str | None = Query(None)):
         None, lambda: _generate_answer(msgs, active_client, max_tokens, model=active_model)
     )
     t_gen = time.perf_counter() - t_gen_start
-
-    if lang == "hi" and _state.get("draft_client"):
-        answer = _romanize_hinglish(answer, _state["draft_client"], _state["draft_model"])
 
     completion_tokens = len(answer.split())
     print(
