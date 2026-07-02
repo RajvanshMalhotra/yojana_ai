@@ -18,3 +18,4 @@ cartesia
 google-genai
 groq
 sarvamai
+pymupdf
