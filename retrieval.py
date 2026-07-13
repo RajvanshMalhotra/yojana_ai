@@ -114,8 +114,12 @@ Extract structured fields from the user query. Return ONLY a raw JSON object:
   "beneficiaries" : list — from: women, farmers, students, elderly, disabled,
                     bpl, sc, st, obc, minority, entrepreneur, widow, child, youth.
                     Use [] if none apply.
-  "category"      : one of: agriculture, health, education, housing, employment,
-                    pension, scholarship, business, social_welfare, other.
+  "category"      : one of: agriculture, health, education, scholarship, housing,
+                    employment, skills, pension, senior, business, entrepreneurship,
+                    social_welfare, women, child, banking, insurance, financial,
+                    sports, culture, technology, science, it, transport,
+                    infrastructure, utility, sanitation, travel, tourism,
+                    disability, public_safety, law, household, other.
   "location"      : "delhi", a state name, "central", or "any".
 
 Return ONLY raw JSON. No markdown."""
@@ -129,25 +133,72 @@ Return ONLY raw JSON. No markdown."""
                 pass
         return {}
 
-    # Maps LLM-returned category names to the actual values stored in chunk metadata
+    # Maps LLM-returned category names to the actual values stored in chunk metadata.
+    # Keys are what the LLM returns; values are exact Pinecone category strings.
     _CATEGORY_MAP = {
         "agriculture":    "agriculturerural_&_environment",
         "health":         "health_&_wellness",
         "education":      "education_&_learning",
+        "scholarship":    "education_&_learning",
         "housing":        "housing_&_shelter",
         "employment":     "skills_&_employment",
+        "skills":         "skills_&_employment",
         "pension":        "senior_citizen",
-        "scholarship":    "education_&_learning",
+        "senior":         "senior_citizen",
         "business":       "business_&_entrepreneurship",
+        "entrepreneurship": "business_&_entrepreneurship",
         "social_welfare": "social_welfare_&_empowerment",
+        "women":          "women_and_child",
+        "child":          "women_and_child",
+        "banking":        "bankingfinancial_services_and_insurance",
+        "insurance":      "bankingfinancial_services_and_insurance",
+        "financial":      "bankingfinancial_services_and_insurance",
+        "sports":         "sports_&_culture",
+        "culture":        "sports_&_culture",
+        "technology":     "science_it_&_communications",
+        "science":        "science_it_&_communications",
+        "it":             "science_it_&_communications",
+        "transport":      "transport_&_infrastructure",
+        "infrastructure": "transport_&_infrastructure",
+        "utility":        "utility_&_sanitation",
+        "sanitation":     "utility_&_sanitation",
+        "travel":         "travel_&_tourism",
+        "tourism":        "travel_&_tourism",
+        "disability":     "social_welfare_&_empowerment",
+        "public_safety":  "public_safetylaw_&_justice",
+        "law":            "public_safetylaw_&_justice",
+        "household":      "household",
     }
+
+    # Regex patterns for common Hindi/Devanagari terms → Pinecone category.
+    # Used by _detect_hindi_filter() to produce a deterministic filter before the
+    # LLM parse runs — avoids relying on an 8B model to return exact English strings
+    # when the query is in Hindi.
+    _HINDI_FILTER_PATTERNS = [
+        (re.compile(r'महिला|महिलाओं|औरत|नारी|स्त्री|बेटी|लड़की'), "women_and_child"),
+        (re.compile(r'किसान|कृषि|खेती|फसल|बागवानी'), "agriculturerural_&_environment"),
+        (re.compile(r'छात्र|छात्रा|विद्यार्थी|शिक्षा|पढ़ाई|स्कॉलरशिप|छात्रवृत्ति'), "education_&_learning"),
+        (re.compile(r'उद्यमी|व्यापार|व्यवसाय|स्टार्टअप|कारोबार'), "business_&_entrepreneurship"),
+        (re.compile(r'बुजुर्ग|वृद्ध|वरिष्ठ\s*नागरिक|पेंशन'), "senior_citizen"),
+        (re.compile(r'विकलांग|दिव्यांग|अपंग'), "social_welfare_&_empowerment"),
+        (re.compile(r'स्वास्थ्य|स्वास्थ|अस्पताल|चिकित्सा|इलाज'), "health_&_wellness"),
+        (re.compile(r'आवास|घर|मकान|आवासीय'), "housing_&_shelter"),
+        (re.compile(r'रोजगार|नौकरी|कौशल|प्रशिक्षण'), "skills_&_employment"),
+        (re.compile(r'बैंक|बीमा|ऋण|लोन|वित्त'), "bankingfinancial_services_and_insurance"),
+    ]
+
+    def _detect_hindi_filter(self, query: str) -> dict | None:
+        """Deterministic keyword filter for Hindi queries — runs before the LLM parse.
+        Returns a Pinecone filter dict if a known Devanagari pattern matches, else None."""
+        for pattern, category in self._HINDI_FILTER_PATTERNS:
+            if pattern.search(query):
+                return {"category": category}
+        return None
 
     def _build_pinecone_filter(self, parsed: dict) -> dict | None:
         """
-        Converts parse_query() output into a Pinecone filter.
-
-        Only category is used — location doesn't exist in the index and
-        beneficiaries are raw scheme tags that don't match semantic labels.
+        Converts _parse_rewrite_expand() output into a Pinecone filter.
+        Used for English queries — Hindi queries use _detect_hindi_filter() first.
         """
         raw_cat = parsed.get("category", "other")
         mapped  = self._CATEGORY_MAP.get(raw_cat)
@@ -368,7 +419,7 @@ Return ONLY a raw JSON object — no markdown, no explanation:
 {{
   "filters": {{
     "beneficiaries": ["from: women,farmers,students,elderly,disabled,bpl,sc,st,obc,minority,entrepreneur,widow,child,youth — empty list if none"],
-    "category": "one of: agriculture,health,education,housing,employment,pension,scholarship,business,social_welfare,other",
+    "category": "one of: agriculture,health,education,scholarship,housing,employment,skills,pension,senior,business,entrepreneurship,social_welfare,women,child,banking,insurance,financial,sports,culture,technology,science,it,transport,infrastructure,utility,sanitation,travel,tourism,disability,public_safety,law,household,other",
     "location": "delhi | <state name> | central | any"
   }},
   "rewritten_query": "clean standalone English query — resolve pronouns from history, fix grammar, strip filler",
@@ -415,7 +466,10 @@ Return ONLY a raw JSON object — no markdown, no explanation:
             filters_raw, rewritten, step_back, expanded = self._parse_rewrite_expand(query, recent_messages)
             print(f"[ret] parse_rewrite_expand={_time.perf_counter()-_t0:.2f}s")
 
-            filters = self._build_pinecone_filter(filters_raw)
+            # Deterministic Hindi keyword filter takes priority over LLM-parsed result.
+            # The LLM (8B Groq) returns inconsistent strings for Hindi beneficiary terms
+            # (e.g. "woman", "महिलाओं", "females") so regex is more reliable.
+            filters = self._detect_hindi_filter(query) or self._build_pinecone_filter(filters_raw)
 
             primary = rewritten if self.use_query_rewrite else query
             queries = [primary]
