@@ -1,7 +1,7 @@
 import { useState, useRef, useCallback, useEffect } from 'react'
 import { motion } from 'framer-motion'
 
-export default function MicButton({ onTranscript, onStopped, disabled, lang }) {
+export default function MicButton({ onTranscript, onStopped, disabled, lang, large = false }) {
   const [recording,  setRecording]  = useState(false)
   const [processing, setProcessing] = useState(false)
   const recorderRef = useRef(null)
@@ -61,6 +61,10 @@ export default function MicButton({ onTranscript, onStopped, disabled, lang }) {
     recording ? stop() : start()
   }, [disabled, processing, recording, start, stop])
 
+  const sz = large ? 64 : 40
+  const radius = large ? 20 : 10
+  const iconSz = large ? 24 : 15
+
   return (
     <motion.button
       onClick={handleClick}
@@ -69,19 +73,20 @@ export default function MicButton({ onTranscript, onStopped, disabled, lang }) {
       transition={recording ? { repeat: Infinity, duration: 0.9 } : {}}
       title={recording ? 'Click to stop' : processing ? 'Transcribing…' : 'Click to speak'}
       style={{
-        width: 40,
-        height: 40,
-        borderRadius: 10,
-        border: 'none',
-        background: recording ? 'var(--gold)' : 'var(--bg-surface-2)',
+        width: sz,
+        height: sz,
+        borderRadius: radius,
+        border: large && !recording ? '1px solid var(--border)' : 'none',
+        background: recording ? 'var(--gold)' : processing ? 'var(--bg-surface-1)' : 'var(--bg-surface-2)',
         color: recording ? '#faf7f2' : processing ? 'var(--gold-dim)' : 'var(--text-muted)',
         cursor: disabled || processing ? 'default' : 'pointer',
         display: 'flex',
         alignItems: 'center',
         justifyContent: 'center',
-        fontSize: 15,
+        fontSize: iconSz,
         flexShrink: 0,
         transition: 'background 0.2s, color 0.2s',
+        boxShadow: large && recording ? '0 0 0 6px rgba(232,160,69,0.15)' : 'none',
       }}
     >
       {processing ? '…' : recording ? '■' : '🎙'}

@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect } from 'react'
+import { Link } from 'react-router-dom'
 import { motion, AnimatePresence } from 'framer-motion'
 import Navbar from '../components/Navbar'
 import Sidebar from '../components/Sidebar'
@@ -107,15 +108,14 @@ function EmptyState({ lang, onLangSelect, onChipClick }) {
 
 export default function Chat() {
   const [messages, setMessages] = useState([])
-  const [input, setInput] = useState('')
   const [isTyping, setIsTyping] = useState(false)
   const [chats, setChats] = useState([])       // [{id, label, messages}]
   const [activeChatId, setActiveChatId] = useState(null)
   const [lang, setLang] = useState(null)        // 'en' | 'hi' | null (not chosen yet)
   const [voiceAudioState, setVoiceAudioState] = useState(null) // 'playing' | 'paused' | null
   const messagesEndRef = useRef(null)
-  const inputRef      = useRef(null)
   const voiceAudioRef = useRef(null)
+  const ttsGenRef = useRef(0)
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -129,11 +129,10 @@ export default function Chat() {
     ))
   }, [messages, activeChatId])
 
-  async function sendMessage(text, { isVoice = false } = {}) {
-    const userMsg = text || input.trim()
+  async function sendMessage(text, { isVoice = true } = {}) {
+    const userMsg = (text || '').trim()
     if (!userMsg) return
 
-    setInput('')
     setMessages(prev => [...prev, { role: 'user', content: userMsg }])
     setIsTyping(true)
 
@@ -149,24 +148,27 @@ export default function Chat() {
 
     let fullAnswer = ''
 
+    // Bump generation so any in-flight playBlob callbacks from a previous message
+    // see a stale gen and exit without touching voiceAudioRef.
+    const myGen = ++ttsGenRef.current
+
     // Sentence-streaming TTS:
     //   First chunk fires at 80 chars so audio starts with minimal lag.
     //   Subsequent chunks fire at 200 chars so each plays long enough for the
     //   next Rumik request to resolve before it's needed (gap-free playback).
-    let ttsBuf      = ''   // within-sentence token buffer
-    let ttsAccum    = ''   // complete-sentence accumulator
-    let ttsFirstSent = false  // lower threshold for the very first TTS call
     const ttsQueue = []
     let ttsPlaying = false
 
     // Each entry = { blob: Blob|null, promise: Promise<Blob> }
     // Blob is cached as soon as the fetch resolves so advanceTTS plays instantly with zero wait.
     function advanceTTS() {
+      if (ttsGenRef.current !== myGen) return
       if (ttsQueue.length === 0) { ttsPlaying = false; setVoiceAudioState('paused'); return }
       ttsPlaying = true
       const entry = ttsQueue.shift()
 
       const playBlob = (blob) => {
+        if (ttsGenRef.current !== myGen) return
         if (!blob) { advanceTTS(); return }
         if (voiceAudioRef.current) {
           voiceAudioRef.current.pause()
@@ -190,13 +192,13 @@ export default function Chat() {
       }
     }
 
-    function enqueueTTS(sentence) {
+    function enqueueTTS(sentence, translated = false) {
       if (!sentence.trim()) return
       const entry = { blob: null, promise: null }
       entry.promise = fetch('/api/voice/tts', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text: sentence.trim(), lang: lang || 'en' }),
+        body: JSON.stringify({ text: sentence.trim(), lang: lang || 'en', translated }),
       })
         .then(r => r.ok ? r.blob() : Promise.reject(r.status))
         .then(blob => { entry.blob = blob; return blob })
@@ -207,23 +209,23 @@ export default function Chat() {
 
     // Split text longer than 250 chars at word boundaries before enqueueing.
     // Prevents sending multi-thousand-char chunks to Rumik (causes timeouts).
-    function enqueueTTSText(text) {
+    function enqueueTTSText(text, translated = false) {
       const MAX = 250
       let t = text.trim()
       while (t.length > MAX) {
         let split = t.lastIndexOf(' ', MAX)
         if (split < 0) split = MAX
-        enqueueTTS(t.slice(0, split).trim())
+        enqueueTTS(t.slice(0, split).trim(), translated)
         t = t.slice(split).trim()
       }
-      if (t) enqueueTTS(t)
+      if (t) enqueueTTS(t, translated)
     }
 
     try {
       const res = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: userMsg, history: messages, lang }),
+        body: JSON.stringify({ message: userMsg, history: messages, lang, voice: isVoice }),
       })
 
       if (!res.ok) throw new Error('API error')
@@ -253,7 +255,9 @@ export default function Chat() {
           }
           const evt = JSON.parse(line.slice(6))
 
-          if (evt.type === 'schemes') {
+          if (evt.type === 'tts') {
+            if (isVoice) enqueueTTSText(evt.content, true)
+          } else if (evt.type === 'schemes') {
             setMessages(prev => {
               const msgs = [...prev]
               msgs[msgs.length - 1] = { ...msgs[msgs.length - 1], schemes: evt.schemes }
@@ -262,27 +266,6 @@ export default function Chat() {
           } else if (evt.type === 'token') {
             setIsTyping(false)
             fullAnswer += evt.content
-            if (isVoice) {
-              ttsBuf += evt.content
-              // Drain all complete sentences from ttsBuf (while loop handles
-              // multiple sentence-endings arriving in a single token batch)
-              let sm
-              while ((sm = /^([\s\S]*?[.!?])\s+([\s\S]*)$/.exec(ttsBuf))) {
-                ttsAccum += (ttsAccum ? ' ' : '') + sm[1]
-                ttsBuf = sm[2]
-              }
-              const threshold = ttsFirstSent ? 200 : 80
-              if (ttsAccum.length >= threshold) {
-                enqueueTTSText(ttsAccum)
-                ttsAccum = ''
-                ttsFirstSent = true
-              } else if (ttsBuf.length > 300) {
-                // Safety: no sentence boundary found but buffer is growing — flush raw
-                enqueueTTSText(ttsBuf.trim())
-                ttsBuf = ''
-                ttsFirstSent = true
-              }
-            }
             setMessages(prev => {
               const msgs = [...prev]
               const last = msgs[msgs.length - 1]
@@ -299,12 +282,6 @@ export default function Chat() {
         }
       }
 
-      // Flush any remaining accumulated sentences + partial sentence, split into
-      // ≤250-char chunks so Rumik doesn't timeout on a large final flush.
-      if (isVoice) {
-        const remaining = (ttsAccum + (ttsBuf.trim() ? ' ' + ttsBuf.trim() : '')).trim()
-        if (remaining) enqueueTTSText(remaining)
-      }
     } catch {
       setMessages(prev => {
         const msgs = [...prev]
@@ -320,13 +297,6 @@ export default function Chat() {
     }
   }
 
-  function handleKeyDown(e) {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault()
-      sendMessage()
-    }
-  }
-
   function handleSelectChat(id) {
     const chat = chats.find(c => c.id === id)
     if (chat) {
@@ -337,11 +307,13 @@ export default function Chat() {
   }
 
   function handleNewChat() {
+    ttsGenRef.current++   // cancel any in-flight TTS generation
+    voiceAudioRef.current?.pause()
     setMessages([])
-    setInput('')
     setActiveChatId(null)
     setLang(null)
-    inputRef.current?.focus()
+    setIsTyping(false)
+    setVoiceAudioState(null)
   }
 
   function handleVoiceStopped() {
@@ -391,7 +363,7 @@ export default function Chat() {
           zIndex: 10,
         }}
       >
-        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+        <Link to="/" style={{ display: 'flex', alignItems: 'center', gap: 10, textDecoration: 'none' }}>
           <span style={{ color: 'var(--gold)', fontSize: 18 }}>✦</span>
           <span
             style={{
@@ -403,35 +375,8 @@ export default function Chat() {
           >
             YojanaAI
           </span>
-        </div>
+        </Link>
 
-        <motion.button
-          whileHover={{ scale: 1.02 }}
-          whileTap={{ scale: 0.97 }}
-          onClick={handleNewChat}
-          style={{
-            background: 'transparent',
-            border: '1px solid var(--border)',
-            color: 'var(--text-muted)',
-            borderRadius: 8,
-            padding: '7px 16px',
-            fontSize: 12,
-            fontFamily: 'Outfit, sans-serif',
-            fontWeight: 400,
-            cursor: 'pointer',
-            transition: 'border-color 0.2s, color 0.2s',
-          }}
-          onMouseEnter={e => {
-            e.currentTarget.style.borderColor = 'var(--border-bright)'
-            e.currentTarget.style.color = 'var(--text-primary)'
-          }}
-          onMouseLeave={e => {
-            e.currentTarget.style.borderColor = 'var(--border)'
-            e.currentTarget.style.color = 'var(--text-muted)'
-          }}
-        >
-          New Chat
-        </motion.button>
       </div>
 
       {/* Body */}
@@ -441,6 +386,7 @@ export default function Chat() {
           activeId={activeChatId}
           onSelect={handleSelectChat}
           isOpen={true}
+          onNewChat={handleNewChat}
         />
 
         {/* Chat area */}
@@ -456,7 +402,7 @@ export default function Chat() {
             }}
           >
             {messages.length === 0 ? (
-              <EmptyState lang={lang} onLangSelect={setLang} onChipClick={text => sendMessage(text)} />
+              <EmptyState lang={lang} onLangSelect={setLang} onChipClick={text => sendMessage(text, { isVoice: true })} />
             ) : (
               <>
                 {messages.map((msg, i) => (
@@ -499,85 +445,26 @@ export default function Chat() {
             </div>
           )}
 
-          {/* Input */}
+          {/* Voice input */}
           <div
             style={{
-              padding: '16px 24px',
+              padding: '20px 24px',
               borderTop: '1px solid var(--border)',
               background: 'rgba(250,247,242,0.92)',
               backdropFilter: 'blur(20px)',
               WebkitBackdropFilter: 'blur(20px)',
+              display: 'flex',
+              justifyContent: 'center',
+              alignItems: 'center',
             }}
           >
-            <div
-              style={{
-                display: 'flex',
-                alignItems: 'center',
-                gap: 12,
-                background: 'var(--bg-surface-1)',
-                border: '1px solid var(--border)',
-                borderRadius: 14,
-                padding: '6px 6px 6px 18px',
-                transition: 'border-color 0.2s, box-shadow 0.2s',
-              }}
-              onFocusCapture={e => {
-                e.currentTarget.style.borderColor = 'var(--gold-dim)'
-                e.currentTarget.style.boxShadow = '0 0 0 3px rgba(232,160,69,0.06)'
-              }}
-              onBlurCapture={e => {
-                e.currentTarget.style.borderColor = 'var(--border)'
-                e.currentTarget.style.boxShadow = 'none'
-              }}
-            >
-              <input
-                ref={inputRef}
-                value={input}
-                onChange={e => setInput(e.target.value)}
-                onKeyDown={handleKeyDown}
-                placeholder="Ask about any scheme or describe your situation..."
-                style={{
-                  flex: 1,
-                  background: 'transparent',
-                  border: 'none',
-                  outline: 'none',
-                  fontFamily: 'Outfit, sans-serif',
-                  fontWeight: 300,
-                  fontSize: 14,
-                  color: 'var(--text-primary)',
-                  height: 40,
-                }}
-              />
-              <MicButton
-                onTranscript={handleVoiceTranscript}
-                onStopped={handleVoiceStopped}
-                disabled={isTyping}
-                lang={lang}
-              />
-
-              <motion.button
-                whileHover={input.trim() ? { scale: 1.05 } : {}}
-                whileTap={input.trim() ? { scale: 0.95 } : {}}
-                onClick={() => sendMessage()}
-                disabled={!input.trim() || isTyping}
-                style={{
-                  width: 40,
-                  height: 40,
-                  borderRadius: 10,
-                  background: input.trim() ? 'var(--gold)' : 'var(--bg-surface-2)',
-                  border: 'none',
-                  color: input.trim() ? '#faf7f2' : 'var(--text-faint)',
-                  fontSize: 18,
-                  cursor: input.trim() && !isTyping ? 'pointer' : 'default',
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                  transition: 'background 0.2s, color 0.2s',
-                  flexShrink: 0,
-                }}
-              >
-                →
-              </motion.button>
-            </div>
+            <MicButton
+              large
+              onTranscript={handleVoiceTranscript}
+              onStopped={handleVoiceStopped}
+              disabled={isTyping}
+              lang={lang}
+            />
           </div>
         </div>
       </div>

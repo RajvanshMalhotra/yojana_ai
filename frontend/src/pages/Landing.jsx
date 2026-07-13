@@ -204,7 +204,7 @@ export default function Landing() {
                     transition: 'background 0.2s, color 0.2s',
                   }}
                 >
-                  Start chatting →
+                  Ask Now !
                 </motion.button>
               </Link>
 

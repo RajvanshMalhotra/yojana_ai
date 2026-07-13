@@ -1,6 +1,6 @@
 import { motion, AnimatePresence } from 'framer-motion'
 
-export default function Sidebar({ chats, activeId, onSelect, isOpen, onToggle }) {
+export default function Sidebar({ chats, activeId, onSelect, isOpen, onToggle, onNewChat }) {
   return (
     <>
       {/* Desktop sidebar */}
@@ -15,10 +15,43 @@ export default function Sidebar({ chats, activeId, onSelect, isOpen, onToggle })
           overflow: 'hidden',
         }}
       >
+        {/* New Chat button */}
+        <div style={{ padding: '12px 12px 0' }}>
+          <button
+            onClick={onNewChat}
+            style={{
+              width: '100%',
+              background: 'transparent',
+              border: '1px solid var(--border)',
+              borderRadius: 8,
+              padding: '8px 12px',
+              cursor: 'pointer',
+              fontFamily: 'Outfit, sans-serif',
+              fontWeight: 400,
+              fontSize: 12,
+              color: 'var(--text-muted)',
+              textAlign: 'left',
+              display: 'flex',
+              alignItems: 'center',
+              gap: 6,
+              transition: 'border-color 0.2s, color 0.2s',
+            }}
+            onMouseEnter={e => {
+              e.currentTarget.style.borderColor = 'var(--border-bright)'
+              e.currentTarget.style.color = 'var(--text-primary)'
+            }}
+            onMouseLeave={e => {
+              e.currentTarget.style.borderColor = 'var(--border)'
+              e.currentTarget.style.color = 'var(--text-muted)'
+            }}
+          >
+            <span style={{ fontSize: 14, lineHeight: 1 }}>+</span> New Chat
+          </button>
+        </div>
+
         <div
           style={{
-            padding: '12px 16px',
-            borderBottom: '1px solid var(--border)',
+            padding: '12px 16px 8px',
             fontFamily: 'Outfit, sans-serif',
             fontWeight: 500,
             fontSize: 11,
