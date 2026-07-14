@@ -117,6 +117,7 @@ class ChatRequest(BaseModel):
     message: str
     history: list[Message] = []
     lang: str | None = None  # "en" | "hi"
+    voice: bool = False       # True when the frontend is in voice mode
 
 class SchemeOut(BaseModel):
     name: str
@@ -159,8 +160,28 @@ def _normalize_for_tts(text: str) -> str:
     text = re.sub(r'`(.+?)`', r'\1', text, flags=re.DOTALL)       # `code`
     text = re.sub(r'^\s*[-*•]\s+', '', text, flags=re.MULTILINE)  # bullet points
     text = re.sub(r'\n+', ' ', text)                               # newlines → space
-    text = re.sub(r'[ऀ-ॿ]+', '', text)                   # strip stray Devanagari
+    # Devanagari kept — sending raw to Rumik to test native support
     text = _CITE_RE.sub('', text)       # strip citation markers [1], [W2]
+
+    # When text is Hindi (contains Devanagari), replace English words Rumik mispronounces
+    if re.search(r'[ऀ-ॿ]', text):
+        # Chandrabindu ँ → anusvara ं — Rumik handles anusvara more cleanly
+        text = text.replace('ँ', 'ं')   # ँ → ं
+
+        _HI_REPLACEMENTS = [
+            (r'स्कीम्स', 'schemes'),
+            (r'स्कीम',   'scheme'),
+            (r'योजनाएं', 'yojnaaen'),
+            (r'योजनाओं', 'yojnaon'),
+            (r'योजनाएँ', 'yojnaaen'),
+            (r'योजना',   'yojna'),
+            (r'\bbenefits\b', 'लाभ'),
+            (r'\beligibility\b', 'पात्रता'),
+            (r'\bgovernment\b', 'सरकार'),
+            (r'\bapplication\b', 'आवेदन'),
+        ]
+        for pat, rep in _HI_REPLACEMENTS:
+            text = re.sub(pat, rep, text, flags=re.IGNORECASE)
 
     # Expand common government scheme acronyms so TTS pronounces them naturally
     _ACRONYMS = {
@@ -231,7 +252,32 @@ def _build_prompt(query: str, chunks: list[dict], web_results: list[dict] = []) 
 
 def _build_messages(prompt: str, recent_msgs: list, summary: str,
                     has_web: bool = False, lang: str | None = None) -> list[dict]:
-    if has_web:
+    if lang == "hi":
+        if has_web:
+            system = (
+                "आप Yojan AI हैं, भारतीय सरकारी योजनाओं के विशेषज्ञ। "
+                "आपके पास दो स्रोत हैं: CONTEXT (verified scheme database) और WEB RESULTS (live search)। "
+                "CONTEXT को primary authoritative source मानें — योजनाओं को [1], [2] आदि से cite करें। "
+                "WEB RESULTS से current details जोड़ें — [W1], [W2] से cite करें। "
+                "दोनों को मिलाकर एक स्वाभाविक उत्तर दें। "
+                "योजनाओं के नाम, benefit amounts, या eligibility criteria जो किसी भी स्रोत में नहीं हैं, वो मत बनाइए। "
+                "Markdown, bullet points, या headers बिल्कुल मत use करें — plain flowing text only। "
+                "हमेशा हिंदी में उत्तर दें। "
+                "योजनाओं को 'scheme' या 'स्कीम' मत कहें — हमेशा 'योजना' या 'योजनाएं' लिखें। "
+                "योजनाओं के अपने नाम (जैसे PM Kisan, PMAY) अंग्रेज़ी में ही रखें — बाकी सब हिंदी में।"
+            )
+        else:
+            system = (
+                "आप Yojan AI हैं, भारतीय सरकारी योजनाओं के विशेषज्ञ। "
+                "CONTEXT (verified scheme database) का उपयोग करके उत्तर दें। योजनाओं को [1], [2] आदि से cite करें। "
+                "योजनाओं के नाम, benefit amounts, या eligibility criteria जो CONTEXT में नहीं हैं, वो मत बनाइए। "
+                "अगर context में कोई exact match नहीं है तो यह बताएं और सबसे relevant योजनाएं describe करें। "
+                "Markdown, bullet points, या headers बिल्कुल मत use करें — plain flowing text only। "
+                "हमेशा हिंदी में उत्तर दें। "
+                "योजनाओं को 'scheme' या 'स्कीम' मत कहें — हमेशा 'योजना' या 'योजनाएं' लिखें। "
+                "योजनाओं के अपने नाम (जैसे PM Kisan, PMAY) अंग्रेज़ी में ही रखें — बाकी सब हिंदी में।"
+            )
+    elif has_web:
         system = (
             "You are Yojan AI, an expert on Indian government schemes. "
             "You have two sources: CONTEXT (verified scheme database) and WEB RESULTS (live search). "
@@ -553,12 +599,65 @@ async def chat(req: ChatRequest):
         """Synchronous SSE generator — runs in FastAPI's threadpool."""
         yield _sse({"type": "schemes", "schemes": [s.model_dump() for s in schemes]})
 
-        buffer        = ""
-        thinking_done = False
         full_answer   = ""
         completion_tokens = 0
         t_gen_start   = time.perf_counter()
         t_first_token = None
+
+        # Think-block filter: buffer until </think> is seen, then stream freely.
+        # If 20 chars pass with no <think>, assume non-thinking model and stream immediately.
+        think_flushed = False
+        in_think      = False
+        pre_buf       = ""
+
+        # Server-side TTS sentence detection (replaces client-side logic)
+        tts_buf       = ""   # within-sentence token accumulator
+        tts_accum     = ""   # complete-sentence accumulator
+        tts_first_sent = False
+        _TTS_PAT = re.compile(r'^([\s\S]*?[.!?])\s+([\s\S]*)$')
+
+        hindi_voice = req.voice and req.lang == "hi"
+
+        def _tts_events(text: str) -> list:
+            """Detect sentence boundaries; return list of SSE strings to yield."""
+            nonlocal tts_buf, tts_accum, tts_first_sent
+            if not req.voice or not text:
+                return []
+            results = []
+            tts_buf += text
+            sm = _TTS_PAT.match(tts_buf)
+            while sm:
+                tts_accum += (" " if tts_accum else "") + sm.group(1)
+                tts_buf = sm.group(2)
+                sm = _TTS_PAT.match(tts_buf)
+            threshold = 200 if tts_first_sent else 80
+            sentence_ready = None
+            if len(tts_accum) >= threshold:
+                sentence_ready = tts_accum.strip()
+                tts_accum = ""
+                tts_first_sent = True
+            elif len(tts_buf) > 300:
+                sentence_ready = tts_buf.strip()
+                tts_buf = ""
+                tts_first_sent = True
+            if sentence_ready:
+                if hindi_voice:
+                    # Translate to Hinglish (Roman script) server-side so Rumik
+                    # receives clean Latin text — sounds significantly better than raw Devanagari.
+                    tts_text = _to_hinglish(sentence_ready)
+                    if tts_text:
+                        results.append(_sse({"type": "tts", "content": tts_text}))
+                else:
+                    results.append(_sse({"type": "tts", "content": sentence_ready}))
+            return results
+
+        def _emit(text: str) -> list:
+            """Return token SSE + any TTS SSEs for the given text."""
+            nonlocal full_answer
+            if not text:
+                return []
+            full_answer += text
+            return [_sse({"type": "token", "content": text})] + _tts_events(text)
 
         for chunk in active_client.chat.completions.create(
             model=active_model, messages=messages, stream=True, max_tokens=max_tokens
@@ -568,28 +667,48 @@ async def chat(req: ChatRequest):
                 continue
 
             completion_tokens += 1
-
             if t_first_token is None:
                 t_first_token = time.perf_counter() - t_gen_start
 
-            if not thinking_done:
-                buffer += token
-                if "</think>" in buffer:
-                    thinking_done = True
-                    after = buffer.split("</think>", 1)[-1].lstrip("\n").strip()
-                    if after:
-                        full_answer += after
+            if think_flushed:
+                yield from _emit(token)
+                continue
+
+            pre_buf += token
+
+            if in_think:
+                if "</think>" in pre_buf:
+                    _, after = pre_buf.split("</think>", 1)
+                    pre_buf = ""
+                    in_think = False
+                    think_flushed = True
+                    yield from _emit(after.lstrip("\n"))
             else:
-                full_answer += token
+                if "<think>" in pre_buf:
+                    before, rest = pre_buf.split("<think>", 1)
+                    pre_buf = rest
+                    in_think = True
+                    yield from _emit(before)
+                elif len(pre_buf) >= 20:
+                    # No <think> — not a thinking model; stream immediately
+                    think_flushed = True
+                    yield from _emit(pre_buf)
+                    pre_buf = ""
 
-        # Model didn't emit </think> — buffer is the answer
-        if not thinking_done and buffer:
-            full_answer = buffer
+        # Flush pre_buf if loop ended before a decision was made
+        if pre_buf:
+            yield from _emit(pre_buf)
 
-        # Stream answer token by token
-        CHUNK = 12
-        for i in range(0, len(full_answer), CHUNK):
-            yield _sse({"type": "token", "content": full_answer[i:i+CHUNK]})
+        # Flush remaining TTS sentence buffer
+        if req.voice:
+            remaining = (tts_accum + (" " + tts_buf.strip() if tts_buf.strip() else "")).strip()
+            if hindi_voice:
+                if remaining:
+                    tts_text = _to_hinglish(remaining)
+                    if tts_text:
+                        yield _sse({"type": "tts", "content": tts_text})
+            elif remaining:
+                yield _sse({"type": "tts", "content": remaining})
 
         t_total_gen = time.perf_counter() - t_gen_start
         ttft = round(t_first_token, 2) if t_first_token is not None else None
@@ -764,42 +883,58 @@ async def voice_stt(request: Request, lang: str | None = Query(None)):
     return JSONResponse({"transcript": transcript})
 
 
+_HINGLISH_PROMPT = (
+    "Convert the following text to Hinglish — Hindi written in Roman/Latin script. "
+    "The input may be in English OR Hindi (Devanagari); handle both.\n"
+    "Rules:\n"
+    "1. Keep ALL scheme names, abbreviations and proper nouns exactly as-is "
+    "(e.g. 'PM Kisan', 'Pradhan Mantri', 'PMAY', 'Ayushman Bharat').\n"
+    "2. Write everything else in colloquial spoken Hindi using only Roman letters.\n"
+    "3. Zero Devanagari characters in output — Roman script only.\n"
+    "4. Output only the converted text, nothing else.\n"
+    "5. Domain glossary: scheme→yojana, government→sarkar, eligibility→patrata, "
+    "benefit→laabh, application→aavedan, ministry→mantralaya, farmer→kisan.\n\n"
+)
+
 def _to_hinglish(text: str) -> str:
-    """Translate English → Hinglish (Hindi in Roman/Latin script) for TTS."""
-    client = _state.get("gemini_client")
-    if not client:
-        return text
+    """Translate to Romanized Hinglish for TTS.
+    Chain: Gemini 2.5 Flash → Groq fallback → raw text (Rumik handles Devanagari natively)."""
+    if not re.search(r'[ऀ-ॿ]', text):
+        return text  # already Latin script, nothing to translate
+
     print(f"[hinglish] in='{text[:120]}'")
-    prompt = (
-        "Translate this English text to Hinglish (Hindi in Roman/Latin script). Rules:\n"
-        "1. Keep ALL scheme names, abbreviations and proper nouns exactly as-is "
-        "(e.g. 'PM Kisan', 'Pradhan Mantri', 'PMAY', 'Ayushman Bharat').\n"
-        "2. Translate only the surrounding explanation to colloquial Hindi in Roman script.\n"
-        "3. No Devanagari characters at all.\n"
-        "4. Output only the translation, nothing else.\n"
-        "5. Use this domain glossary for key terms:\n"
-        "   scheme → 'yojana', government → 'sarkar', eligibility → 'patrata',\n"
-        "   benefit → 'laabh', application → 'aavedan', ministry → 'mantralaya',\n"
-        "   farmer → 'kisan', subsidy → 'subsidy', loan → 'loan', amount → 'rashi'.\n\n"
-        f"{text}"
-    )
-    try:
-        from google.genai import types as _gtypes
-        resp = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=prompt,
-            config=_gtypes.GenerateContentConfig(
-                thinking_config=_gtypes.ThinkingConfig(thinking_budget=0),
-            ),
-        )
-        result = (resp.text or "").strip()
-        if re.search(r'[ऀ-ॿ]', result):
-            return text
-        print(f"[hinglish] out='{result[:120]}'")
-        return result or text
-    except Exception as e:
-        print(f"[hinglish] error: {e}")
-        return text
+
+    # 1. Try Gemini (best quality, but free tier = 20 req/day)
+    gemini = _state.get("gemini_client")
+    if gemini:
+        try:
+            from google.genai import types as _gtypes
+            resp = gemini.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=_HINGLISH_PROMPT + text,
+                config=_gtypes.GenerateContentConfig(
+                    thinking_config=_gtypes.ThinkingConfig(thinking_budget=0),
+                ),
+            )
+            result = (resp.text or "").strip()
+            if result and not re.search(r'[ऀ-ॿ]', result):
+                print(f"[hinglish] gemini out='{result[:120]}'")
+                return result
+        except Exception as e:
+            print(f"[hinglish] gemini error ({type(e).__name__}), trying Groq fallback")
+
+    # 2. Groq fallback (fast, high rate-limits)
+    draft_client = _state.get("draft_client")
+    draft_model  = _state.get("draft_model", "")
+    if draft_client:
+        result = _romanize_hinglish(text, draft_client, draft_model)
+        if result and not re.search(r'[ऀ-ॿ]', result):
+            print(f"[hinglish] groq out='{result[:120]}'")
+            return result
+
+    # 3. Last resort: send raw text — Rumik Mulberry handles Devanagari natively
+    print("[hinglish] all translators failed, sending raw text to Rumik")
+    return text
 
 
 @app.post("/api/voice/tts")
@@ -808,7 +943,8 @@ async def voice_tts(request: Request):
     import requests as _req
     body = await request.json()
     text = (body.get("text") or "").strip()
-    lang = body.get("lang", "en")
+    lang       = body.get("lang", "en")
+    translated = body.get("translated", False)  # True = already Hinglish, skip re-translation
     if not text:
         return JSONResponse({"error": "empty_text"}, status_code=400)
 
@@ -816,12 +952,13 @@ async def voice_tts(request: Request):
     if not rumik_key:
         return JSONResponse({"error": "rumik_not_configured"}, status_code=503)
 
-    if lang == "hi":
+    if lang == "hi" and not translated:
         loop = asyncio.get_running_loop()
         text = await loop.run_in_executor(None, _to_hinglish, text)
 
     clean = _normalize_for_tts(text)
-    if not clean:
+    # Reject if nothing readable remains (bare punctuation/whitespace)
+    if not clean or not re.search(r'[a-zA-Z0-9ऀ-ॿ]', clean):
         return JSONResponse({"error": "empty_after_normalisation"}, status_code=400)
 
     # Rumik 2000-char limit; frontend sends ≤250-char chunks so this is a safety cap.
@@ -839,8 +976,9 @@ async def voice_tts(request: Request):
             json={
                 "model": "mulberry",
                 "text": payload_text,
-                "speaker": "speaker_3",
-                "description": "A 30-year-old Indian female voice with a confident and energetic tone, suitable for an ad narrator.",
+                # description only — per Rumik docs, speaker takes precedence over description
+                # so never send both; description gives us the Indian accent we need.
+                "description": "a female 30s hindi accent voice, brisk pacing, energetic emotion, neutral register, like a helpful government advisor",
             },
             timeout=20,
         )

@@ -78,6 +78,14 @@ This directly instructed the model to force-fit irrelevant schemes and invent co
 `multi_query_retrieval` called `encode()` from multiple threads simultaneously → Rust backend "Already borrowed" panic.
 Fix: batch-encode all queries serially first, then parallelize only the Pinecone network calls.
 
+### Gemini Free Tier Kills Hindi TTS Silently (2026-07-15)
+`_to_hinglish()` used Gemini 2.5 Flash exclusively. The free tier limit is **20 requests/day**.
+After any non-trivial testing session the quota is exhausted → every call throws 429 → function returned `""` → no TTS events emitted → **audio silently disappears with no user-visible error**.
+The bug looks like "audio not working" but is actually a rate-limit issue invisible in the frontend.
+Fix: chain three translators in order — Gemini (best quality) → Groq llama-3.1-8b-instant fallback (6000 RPM, already in server) → raw Devanagari to Rumik (handles natively, slightly lower audio quality).
+Never return `""` from `_to_hinglish` — always return something Rumik can synthesize.
+Diagnostic: `grep "\[hinglish\]" /tmp/yojan_server.log` shows which path fired and any 429 errors.
+
 ### Complexity Router Miscalibration (2026-07-02)
 Original prompt: "Does this query have multiple constraints or eligibility criteria?"
 "govt schemes for AI startups" was classified Complex → 72B used → 33s generation time.
@@ -101,6 +109,29 @@ Fix: `audio_idle_timeout=1.5`, `SpeechTimeoutUserTurnStopStrategy(user_speech_ti
 ### Estonian Hallucination (2026-07-02)
 Groq's Llama model generated responses in Estonian when no language instruction was given for English.
 Fix: Explicit "Always respond in English only. Never use any other language." in system prompt.
+
+### Rumik `speaker` Overrides `description` (2026-07-15)
+Sending both `speaker` and `description` to Rumik Mulberry silently ignores `description` — `speaker` always takes precedence per the API docs.
+Result: the "30-year-old Indian female" description was never applied; we were always getting a generic preset voice.
+Fix: remove `speaker`, use only `description` with `hindi` accent: `"a female 30s hindi accent voice, brisk pacing, energetic emotion, neutral register, like a helpful government advisor"`.
+Mulberry description template: `a {gender} {age} {accent} voice, {pitch} pitch, {timbre}, {pacing} pacing, {emotion}, {register} register, like a {role}`.
+
+### Hindi TTS Only Playing First Sentence (2026-07-15)
+A `_hindi_tts_done` flag inside `_tts_events()` (in `_stream_gen`) was intentionally dropping all TTS events after the first sentence for Hindi — a demo hack that was never removed.
+Fix: remove the flag entirely. Translate each sentence to Hinglish via `_to_hinglish()` server-side inside `_tts_events()` before emitting the SSE event. The frontend's `translated=True` flag then correctly tells `/api/voice/tts` to skip the redundant second Gemini call.
+
+### Pinecone Category Filter Missing `women_and_child` (2026-07-15)
+`_CATEGORY_MAP` only had 9 entries mapping LLM output to Pinecone categories. The index has 18+ actual categories including `women_and_child` (129 schemes), `bankingfinancial_services_and_insurance`, `sports_&_culture`, etc.
+A "schemes for women" query mapped to `social_welfare_&_empowerment` (1047 chunks, mostly unrelated) instead of `women_and_child` (129 dedicated women's schemes).
+Fix: inspect the live index with `collections.Counter(c.get('category') for c in chunks)` and add all real categories to the map.
+Command: `python3 -c "import pickle,collections; chunks=pickle.load(open('data/scheme_chunks.pkl','rb')); [print(n,c) for c,n in sorted(collections.Counter(c.get('category','') for c in chunks).items(), key=lambda x:-x[1])]"`
+
+### Hindi Queries Bypass LLM Category Parsing — Use Regex Instead (2026-07-15)
+`_parse_rewrite_expand()` uses Groq 8B to extract `beneficiaries` and `category` from the query. For Hindi queries, the 8B model returned inconsistent strings — sometimes `"महिलाओं"` (Devanagari), sometimes `"woman"` (singular), sometimes nothing — causing `_build_pinecone_filter()` to return `None` 50%+ of the time.
+Without a filter, Pinecone searches all 4700+ chunks and semantic drift returns irrelevant results (fishing canoes, electricity schemes for a "women's schemes" query).
+Fix: add `_detect_hindi_filter(query)` — a deterministic regex pre-filter that runs BEFORE the LLM parse and takes priority over it. Devanagari patterns (`महिला|महिलाओं|औरत` → `women_and_child`, etc.) are matched reliably at zero LLM cost.
+Wire-up in `retrieve()`: `filters = self._detect_hindi_filter(query) or self._build_pinecone_filter(filters_raw)`.
+Result: 5/5 runs returned only `women_and_child` schemes vs. 1/3 before the fix.
 
 ---
 
